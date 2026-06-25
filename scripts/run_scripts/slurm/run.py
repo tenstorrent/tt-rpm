@@ -76,12 +76,12 @@ class Experiment:
 @dataclasses.dataclass
 class Benchmark:
     name: str
-    type: str               # 'elf' | 'trace'
+    type: str               # 'elf'
     path: Path
     workload_files: list[Path]
 
     def model_flag(self) -> str:
-        return "--target-elf" if self.type == "elf" else "--trace-file"
+        return "--target-elf"
 
 
 # ---------------------------------------------------------------------------
@@ -141,9 +141,9 @@ def load_benchmarks_yaml(registry_path: Path, repo_root: Path) -> dict[str, dict
         spec["path"] = resolved
         spec.setdefault("glob", "*")
         spec.setdefault("type", "elf")
-        if spec["type"] not in ("elf", "trace"):
+        if spec["type"] != "elf":
             raise ValueError(
-                f"benchmark '{name}': type must be 'elf' or 'trace', got {spec['type']!r}")
+                f"benchmark '{name}': type must be 'elf', got {spec['type']!r}")
     return data
 
 
@@ -172,23 +172,17 @@ def materialize_benchmarks(
 
 
 def materialize_ad_hoc_benchmark(
-    kind: str, directory: Path, workload_prefixes: Optional[list[str]]
+    directory: Path, workload_prefixes: Optional[list[str]]
 ) -> Benchmark:
-    if kind == "elf":
-        patterns = ("*.elf",)
-        bench_name = "elfs"
-    else:
-        patterns = ("*-trace.csv.zst", "*.csv.zst", "*.csv")
-        bench_name = "traces"
     files: list[Path] = []
-    for pat in patterns:
+    for pat in ("*.elf",):
         files.extend(directory.glob(pat))
     files = sorted(set(files))
     if workload_prefixes:
         files = [f for f in files if any(f.name.startswith(p) for p in workload_prefixes)]
     if not files:
-        raise FileNotFoundError(f"no {kind} files found under {directory}")
-    return Benchmark(name=bench_name, type=kind, path=directory, workload_files=files)
+        raise FileNotFoundError(f"no ELF files found under {directory}")
+    return Benchmark(name="elfs", type="elf", path=directory, workload_files=files)
 
 
 # ---------------------------------------------------------------------------
@@ -342,8 +336,8 @@ def wrap_task_cmd(
 
 def workload_base(workload: Path) -> str:
     base = workload.name
-    # drop obvious trace extensions but keep ELFs intact
-    for suffix in (".csv.zst", ".csv", ".elf"):
+    # strip the .elf extension to form the workload's base name
+    for suffix in (".elf",):
         if base.endswith(suffix):
             base = base[: -len(suffix)]
             break
@@ -386,8 +380,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="Comma-separated names from benchmarks.yml")
     p.add_argument("--benchmarks-yml", type=Path, default=SCRIPT_DIR / "benchmarks.yml",
                    help="Path to benchmarks.yml (default: alongside run.py)")
-    p.add_argument("--trace-dir", type=Path, default=None,
-                   help="Ad-hoc sweep of traces in a directory (skips benchmarks.yml)")
     p.add_argument("--elf-dir", type=Path, default=None,
                    help="Ad-hoc sweep of ELFs in a directory (skips benchmarks.yml)")
     p.add_argument("--benches", default=None,
@@ -412,7 +404,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         "metadata path, falling back to IPC-only")
     p.add_argument("--metadata-file", type=Path, default=None,
                    help="metadata.yml with Dynamic-Insts for the notebook "
-                        "(auto-detected from a trace directory when omitted)")
+                        "(auto-detected from the workload directory when omitted)")
     p.add_argument("--core", default="rpm",
                    help="Core profile selecting the counter map for the study "
                         "notebook/report (e.g. rpm); "
@@ -432,16 +424,14 @@ def select_benchmarks(args: argparse.Namespace) -> list[Benchmark]:
     prefixes = [s.strip() for s in args.benches.split(",")] if args.benches else None
     ad_hoc: list[Benchmark] = []
     if args.elf_dir:
-        ad_hoc.append(materialize_ad_hoc_benchmark("elf", args.elf_dir.resolve(), prefixes))
-    if args.trace_dir:
-        ad_hoc.append(materialize_ad_hoc_benchmark("trace", args.trace_dir.resolve(), prefixes))
+        ad_hoc.append(materialize_ad_hoc_benchmark(args.elf_dir.resolve(), prefixes))
     if args.benchmarks:
         names = [s.strip() for s in args.benchmarks.split(",") if s.strip()]
         registry = load_benchmarks_yaml(args.benchmarks_yml, REPO_ROOT)
         ad_hoc.extend(materialize_benchmarks(registry, names, prefixes))
     if not ad_hoc:
         raise SystemExit(
-            "error: pick workloads via --benchmarks NAME[,NAME...], --elf-dir DIR, or --trace-dir DIR")
+            "error: pick workloads via --benchmarks NAME[,NAME...] or --elf-dir DIR")
     return ad_hoc
 
 
@@ -464,9 +454,9 @@ def main(argv: list[str]) -> int:
 
     # Drop a ready-to-run performance-study notebook into the study root.
     # With no explicit --metadata-file, leave the path empty: study_report.py
-    # (and the notebook) derive the metadata.yml(s) from the study's own trace
-    # paths, which covers studies spanning several trace sets (a single pinned
-    # file would only score one suite and break the others).
+    # (and the notebook) derive the metadata.yml(s) from the study's own
+    # workload paths, which covers studies spanning several workload sets (a
+    # single pinned file would only score one suite and break the others).
     metadata_file = args.metadata_file
     if args.metadata_file and not args.metadata_file.is_file():
         print(f"warning: --metadata-file {args.metadata_file} not found", file=sys.stderr)

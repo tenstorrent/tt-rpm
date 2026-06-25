@@ -43,9 +43,7 @@ The CPU model supports:
 - **Configurable cache hierarchy** (L1 I-cache, L1 D-cache, optional unified L2)
 - **Detailed microarchitectural modeling** including bypass networks, banked register files, and write port arbitration
 
-The model is driven by either:
-- An **ELF binary** executed via the Whisper ISS
-- A **pre-recorded trace file** for deterministic replay
+The model is driven by an **ELF binary** executed via the Whisper ISS.
 
 ---
 
@@ -66,8 +64,7 @@ If no configuration is found, built-in defaults are used.
 
 ```yaml
 top:
-  target_command: '/path/to/binary.elf'  # ELF to execute (empty for trace mode)
-  trace_filename: ''                      # Trace file (empty for ELF mode)
+  target_command: '/path/to/binary.elf'  # ELF to execute
   
   logging:
     enabled: false        # Enable debug logging for ALL units
@@ -82,25 +79,15 @@ top:
 
 ---
 
-## Execution Modes
+## Execution Mode
 
-### ELF-Driven Mode
 ```yaml
 top:
   target_command: '/path/to/program.elf'
-  trace_filename: ''
 ```
 The model runs the RISC-V ELF binary using Whisper as the golden ISS. Instructions are fetched from the binary and executed functionally by Whisper while the model tracks timing.
 
-### Trace-Driven Mode
-```yaml
-top:
-  target_command: ''
-  trace_filename: '/path/to/trace.json'
-```
-The model replays a pre-recorded instruction trace. This provides deterministic, reproducible simulation for debugging and validation.
-
-> **Note**: Command-line flags `--target` and `--trace` override the config file settings.
+> **Note**: The command-line flag `--target-elf` overrides the config file setting.
 
 ---
 
