@@ -145,7 +145,7 @@ A preset in-order config is at `models/cpu/src/core/config_inorder.yaml`:
                                        ┌───────────┐   ┌───────┐         │
                                        │ Writeback │◀──│  LSQ  │◀────────┘
                                        │   (ROB)   │   └───┬───┘
-                                       └───────────┘      │ req/resp
+                                       └───────────┘       │ req/resp
                                                       ┌────▼───┐
                                                       │ DCache │
                                                       └────────┘
@@ -153,9 +153,9 @@ A preset in-order config is at `models/cpu/src/core/config_inorder.yaml`:
   Branch prediction:  Fetch ─▶ Branch Pred ─▶ Decode (predictions);  Fetch ⇄ ICache
   Queues:             FetchQueue & DecodeQueue buffer ICache→Decode and Decode→Rename
                       (skipped when bypass_queues=true)
-  Wakeup / commit:    Execute & LSQ ─completion▶ Issue;  Execute & LSQ ─ROB complete▶ Writeback;
-                      Writeback ─commit▶ Rename
-  Branch resolve:     Execute ─resolved▶ Fetch, Issue, Writeback
+  Wakeup / commit:    Execute & LSQ ─▶ Issue;  Execute & LSQ ─▶ Writeback;
+                      Writeback ─▶ Rename
+  Branch resolve:     Execute ─▶ Fetch, Issue, Writeback
   Flush / redirect:   Branch Pred, Execute, Writeback ─▶ FlushArbiter ─▶ flush all stages,
                       redirect Fetch
   Memory hierarchy:   ICache ⇄ L2Cache ⇄ DCache   (L2 optional, disabled by default)
