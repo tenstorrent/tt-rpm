@@ -9,7 +9,7 @@ git clone <repository-url> rpm
 cd rpm
 git submodule update --init --recursive
 bash scripts/build_scripts/build_all.sh
-./build/core/core 500 tests/programs/burst_8.elf
+./build/core/core 500 tests/build/coremark.bare.elf
 ```
 
 Or via Docker (no local dependencies needed):
@@ -24,23 +24,23 @@ bash ci/docker_build.sh --test
 
 ```bash
 # ELF execution-driven (legacy positional syntax)
-./build/core/core 500 tests/programs/burst_8.elf
+./build/core/core 500 tests/build/coremark.bare.elf
 
 # Named flags (equivalent)
-./build/core/core -r 500 -c models/cpu/src/core/config.yaml --target-elf tests/programs/burst_8.elf
+./build/core/core -r 500 -c models/cpu/src/core/config.yaml --target-elf tests/build/coremark.bare.elf
 ```
 
-### SPEC Simpoint Traces
+### Whisper Traces
 
 ```bash
-# Run a 20M-instruction SPEC simpoint (instruction limit with -i)
+# Run a Whisper trace for up to 20M instructions (instruction limit with -i)
 ./build/core/core -r 100000000 -i 20000000 \
   -c models/cpu/src/core/config.yaml \
-  --trace-file /path/to/traces/gcc_r-ref-inp4-i20M-k100-s758-w04251-trace.csv.zst
+  --trace-file /path/to/trace.csv.zst
 ```
 
-The model automatically derives the snapshot folder from the trace filename
-(parses simpoint ID and interval) and loads the Whisper memory/register snapshot.
+The model derives the snapshot location from the trace filename and loads the
+corresponding Whisper memory/register snapshot.
 
 ### Key Command-Line Flags
 
@@ -62,11 +62,11 @@ Use `-l` to enable per-unit logging:
 
 ```bash
 # Log ExecutionDriver info messages
-./build/core/core -r 1000 --target-elf tests/programs/burst_8.elf \
+./build/core/core -r 1000 --target-elf tests/build/coremark.bare.elf \
   -l top.core0.edriver info edriver.log
 
 # Log all writeback activity
-./build/core/core -r 1000 --target-elf tests/programs/burst_8.elf \
+./build/core/core -r 1000 --target-elf tests/build/coremark.bare.elf \
   -l top.core0.writeback info wb.log
 ```
 
@@ -90,7 +90,7 @@ pipeline counters, cache hit rates, and branch prediction accuracy.
 bash scripts/run_scripts/run_sim.sh -m core -n 20000000 -t /path/to/trace.csv.zst
 
 # ELF execution-driven run
-bash scripts/run_scripts/run_sim.sh -m core -n 1000 -e tests/programs/burst_8.elf
+bash scripts/run_scripts/run_sim.sh -m core -n 1000 -e tests/build/coremark.bare.elf
 ```
 
 Output is saved to `build/<model>/output/<timestamp>/`:
@@ -138,7 +138,7 @@ top.core0:
 
 A preset in-order config is at `models/cpu/src/core/config_inorder.yaml`:
 ```bash
-./build/core/core -r 1000 -c models/cpu/src/core/config_inorder.yaml --target-elf tests/programs/burst_8.elf
+./build/core/core -r 1000 -c models/cpu/src/core/config_inorder.yaml --target-elf tests/build/coremark.bare.elf
 ```
 
 ## Pipeline Architecture
@@ -250,8 +250,10 @@ rpm/
 │
 ├── configs/                        # Simulation configurations
 │
-└── tests/                          # Tests
-    └── programs/                   # Microbenchmark ELFs (built from source)
+└── tests/                          # Bare-metal CoreMark / Dhrystone workloads
+    ├── Makefile                    # Builds + runs the workloads in the core model
+    ├── coremark/                   # CoreMark submodule (+ bare-metal patch)
+    └── riscv-tests/               # riscv-tests submodule (Dhrystone source)
 ```
 
 ## Build Scripts
@@ -263,7 +265,7 @@ All scripts are in `scripts/build_scripts/` and accept `--help`.
 | `setup_env.sh` | Check that all prerequisites and submodules are available |
 | `build_deps.sh` | Build external dependencies (Sparta, Whisper, trace-reader) |
 | `build_model.sh` | Build a specific model (`--model simple\|core`) or `--all` |
-| `build_all.sh` | One-shot: env check + deps + all models + test programs |
+| `build_all.sh` | One-shot: env check + deps + all models + test workloads |
 
 ```bash
 # Clean rebuild in Debug mode
@@ -273,12 +275,30 @@ bash scripts/build_scripts/build_model.sh --model core --clean --type Debug
 bash scripts/build_scripts/build_deps.sh --jobs 8
 ```
 
+## Tests
+
+The `tests/` directory builds bare-metal **CoreMark** and **Dhrystone** ELFs
+(no OS; crt0 + linker script at `0x80000000`, console/exit via HTIF `tohost`)
+and runs them in the core model:
+
+```bash
+make -C tests                 # build both ELFs -> tests/build/
+make -C tests run_coremark    # build + run CoreMark in the core model
+make -C tests run_dhrystone   # build + run Dhrystone in the core model
+make -C tests clean
+```
+
+Built ELFs land in `tests/build/` (e.g. `tests/build/coremark.bare.elf`).
+Building them needs a bare-metal RISC-V toolchain (`riscv64-unknown-elf-gcc`);
+see `tests/install-toolchain-conda.sh`.
+
 ## Prerequisites
 
 Run `bash scripts/build_scripts/setup_env.sh` to verify. You need:
 
 - **Build tools:** CMake >= 3.17, Make, g++-13 (C++23), git
 - **Libraries:** Boost >= 1.74, yaml-cpp >= 0.7, RapidJSON >= 1.1, SQLite3 >= 3.19, zlib, HDF5 >= 1.10
+- **Tests (optional):** bare-metal RISC-V toolchain `riscv64-unknown-elf-gcc` (see `tests/install-toolchain-conda.sh`)
 
 On Ubuntu 22.04:
 ```bash

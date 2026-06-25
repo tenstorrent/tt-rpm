@@ -28,8 +28,10 @@ echo "[Step 4/5] Building all models..."
 "$SCRIPT_DIR/build_model.sh" --all ${ARGS[@]+"${ARGS[@]}"}
 echo ""
 
-echo "[Step 5/5] Building test programs..."
-make -C "$RPM_ROOT/tests/programs" generated
+echo "[Step 5/5] Building test workloads..."
+if ! make -C "$RPM_ROOT/tests" all; then
+    echo "  (skipped: bare-metal RISC-V toolchain required; see tests/install-toolchain-conda.sh)" >&2
+fi
 echo ""
 
 echo "============================================"
