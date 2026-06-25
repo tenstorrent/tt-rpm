@@ -158,7 +158,8 @@ A preset in-order config is at `models/cpu/src/core/config_inorder.yaml`:
   Branch resolve:     Execute ─▶ Fetch, Issue, Writeback
   Flush / redirect:   Branch Pred, Execute, Writeback ─▶ FlushArbiter ─▶ flush all stages,
                       redirect Fetch
-  Memory hierarchy:   ICache ⇄ L2Cache ⇄ DCache   (L2 optional, disabled by default)
+  Memory hierarchy:   L1 ICache and L1 DCache each fill from a shared L2Cache
+                      (L2 optional, disabled by default)
   Execution engine:   ExecutionDriver (Whisper ISS) supplies functional results;
                       PipelineClock ticks every stage (default 3 GHz)
 ```
