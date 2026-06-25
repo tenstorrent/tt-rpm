@@ -55,6 +55,22 @@ CM_SRCS := $(RT)/crt0.S \
            $(CM)/core_state.c $(CM)/core_util.c \
            $(RT)/core_portme.c $(RT)/ee_printf.c $(RT)/cvt.c
 
+# check_cc: fail early with guidance if the bare-metal RISC-V compiler is missing.
+# Invoked at the top of each compile recipe, so it only fires when a build is
+# actually needed -- an already-built ELF still runs (run_*) without the toolchain.
+define check_cc
+command -v $(CC) >/dev/null 2>&1 || { \
+    echo "error: RISC-V cross compiler '$(CC)' not found in PATH." >&2; \
+    echo "       The tests need the bare-metal (newlib) toolchain riscv64-unknown-elf-gcc;" >&2; \
+    echo "       a glibc '*-linux-gnu-gcc' will not work." >&2; \
+    echo "       Install it (one-time) and activate the env, then retry:" >&2; \
+    echo "         bash $(HERE)/install-toolchain-conda.sh   # creates conda env 'riscv'" >&2; \
+    echo "         conda activate riscv" >&2; \
+    echo "       Or point CC at an existing toolchain:" >&2; \
+    echo "         make -C tests CC=/path/to/riscv64-unknown-elf-gcc" >&2; \
+    exit 1; }
+endef
+
 .PHONY: all coremark dhrystone run_coremark run_dhrystone clean help patch
 
 all: coremark dhrystone
@@ -83,21 +99,30 @@ $(WHISPER): $(HERE)/whisper.json | $(BUILD)
 	cp -f $< $@
 
 $(CM_ELF): $(CM_SRCS) $(RT)/link.ld | $(BUILD) $(WHISPER)
+	@$(call check_cc)
 	@echo "==> Building bare-metal CoreMark (ITERATIONS=$(ITERATIONS))"
 	$(CC) $(COMMON_CFLAGS) -I$(CM) -I$(RT) \
 	    -DITERATIONS=$(ITERATIONS) -DPERFORMANCE_RUN=1 -DHAS_FLOAT=0 \
 	    -DFLAGS_STR='"-O2 -g -march=rv64gc -mabi=lp64d barebones (int-only)"' \
 	    $(CM_SRCS) -o $@ -lgcc
 
-# -fpermissive: Dhrystone is pre-ANSI K&R C, hard errors under GCC 14.
+# DHRY_CFLAGS: Dhrystone is pre-ANSI K&R C. -std=gnu11 keeps the legacy meaning
+# of empty parens `()` (unspecified args), which C23 (the GCC 15+ default) would
+# otherwise treat as `(void)` and reject K&R calls. GCC 14+ also promotes
+# implicit-int, implicit-function-declaration, int-conversion and
+# incompatible-pointer-types to hard errors; downgrade them so the source builds.
 # -I$(DHRY) first so our util.h shim wins over the submodule's common util.h.
 # Submodule sources are checked in-recipe (not as prereqs) for a friendly message.
+DHRY_CFLAGS := -std=gnu11 \
+               -Wno-error=implicit-int -Wno-error=implicit-function-declaration \
+               -Wno-error=int-conversion -Wno-error=incompatible-pointer-types
 $(DHRY_ELF): $(RT)/crt0.S $(RT)/ee_printf.c $(RT)/link.ld $(DHRY)/util.h | $(BUILD) $(WHISPER)
+	@$(call check_cc)
 	@test -f $(DHRY_SRC)/dhrystone_main.c || { \
 	    echo "error: riscv-tests submodule not initialized ($(DHRY_SRC) missing)" >&2; \
 	    echo "       run: git submodule update --init tests/riscv-tests" >&2; exit 1; }
 	@echo "==> Building bare-metal Dhrystone (NUMBER_OF_RUNS=1000)"
-	$(CC) $(COMMON_CFLAGS) -fpermissive \
+	$(CC) $(COMMON_CFLAGS) $(DHRY_CFLAGS) \
 	    -I$(DHRY) -I$(DHRY_SRC) -I$(CM) -I$(RT) -DHAS_FLOAT=0 \
 	    $(RT)/crt0.S $(DHRY_SRC)/dhrystone.c $(DHRY_SRC)/dhrystone_main.c $(RT)/ee_printf.c \
 	    -o $@ -lgcc
@@ -113,7 +138,7 @@ run_dhrystone: $(DHRY_ELF)
 # Expanded as one shell command (backslash-joined) so it works as a single recipe line.
 define run_model
 echo "==> Built $(1)"; file $(1); \
-if $(OBJDUMP) -d $(1) | grep -qw ecall; then \
+if command -v $(OBJDUMP) >/dev/null 2>&1 && $(OBJDUMP) -d $(1) | grep -qw ecall; then \
     echo "warning: $(1) contains ecall instructions (will stall the model)" >&2; fi; \
 if [ ! -x $(CORE) ]; then \
     echo "error: core model not found at $(CORE) (build it first)" >&2; exit 1; fi; \

@@ -13,6 +13,7 @@ ilog*.txt
 *.ansi
 *.ans
 pipeline*.txt
+*.dbg
 
 # Python
 __pycache__/

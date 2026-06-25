@@ -13,7 +13,6 @@ if ! command -v conda &>/dev/null; then
     echo "  2. Run: bash Miniconda3-latest-Linux-x86_64.sh"
     echo "  3. Restart your shell, then run this script again."
     echo ""
-    echo "Or use the prebuilt toolchain (no conda): ./install-toolchain-local.sh"
     exit 1
 fi
 

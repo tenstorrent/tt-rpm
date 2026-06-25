@@ -36,7 +36,7 @@ case "$ACTION" in
         "${DOCKER_RUN[@]}" bash -c "\
             git submodule update --init --recursive && \
             bash scripts/build_scripts/build_all.sh && \
-            cd build/core && ./core 500 ../../tests/programs/burst_8.elf"
+            make -C tests run_coremark"
         ;;
     build|*)
         "${DOCKER_RUN[@]}" bash -c "\

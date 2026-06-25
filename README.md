@@ -144,41 +144,33 @@ A preset in-order config is at `models/cpu/src/core/config_inorder.yaml`:
 ## Pipeline Architecture
 
 ```
-                              Core Pipeline (core0)
-  ┌─────────────────────────────────────────────────────────────────────────────┐
-  │                                                                             │
-  │  ┌───────────┐    ┌────────┐    ┌────────┐    ┌────────┐    ┌────────┐     │
-  │  │           │───▶│        │───▶│        │───▶│        │───▶│        │     │
-  │  │   Fetch   │    │ ICache │    │ Decode │    │ Rename │    │ Issue  │     │
-  │  │           │◀───│        │    │        │    │        │◀───│        │     │
-  │  └─────┬─────┘    └────┬───┘    └────────┘    └───┬────┘    └───┬────┘     │
-  │        │               │                          │             │          │
-  │        │          ┌────┴───┐                      │        ┌────▼────┐     │
-  │        ├─────────▶│ Branch │                      │        │         │     │
-  │        │◀─────────│  Pred  │                      │        │ Execute │     │
-  │        │          └────────┘                      │        │         │     │
-  │        │                                          │        └──┬──┬───┘     │
-  │        │                                          │           │  │         │
-  │        │                                     ┌────▼────┐      │  │         │
-  │        │                                     │  Write  │◀─────┘  │         │
-  │        │                                     │  back   │         │         │
-  │        │                                     │  (ROB)  │    ┌────▼────┐    │
-  │        │                                     └─────────┘    │         │    │
-  │        │                                                    │   LSQ   │    │
-  │        │                                                    │         │    │
-  │        │                                                    └────┬────┘    │
-  │        │                                                         │         │
-  │        │          ┌─────────┐                              ┌─────▼────┐    │
-  │        │          │         │                              │          │    │
-  │        └─────────▶│ L2Cache │◀─────────────────────────────│  DCache  │    │
-  │                   │         │                              │          │    │
-  │                   └─────────┘                              └──────────┘    │
-  │                                                                            │
-  │  ┌───────────────┐    ┌────────────────────┐                               │
-  │  │ PipelineClock │    │ ExecutionDriver    │                               │
-  │  │  (3 GHz)      │    │ (Whisper ISS)      │                               │
-  │  └───────────────┘    └────────────────────┘                               │
-  └─────────────────────────────────────────────────────────────────────────────┘
+                                Core Pipeline (core0)
+
+  Main dataflow (in-order front end, out-of-order back end):
+
+    ┌───────┐   ┌────────┐   ┌────────┐   ┌────────┐   ┌───────┐   ┌─────────┐
+    │ Fetch │──▶│ ICache │──▶│ Decode │──▶│ Rename │──▶│ Issue │──▶│ Execute │
+    └───────┘◀──└────────┘   └────────┘   └────────┘   └───────┘   └────┬────┘
+                                                                 mem ops │
+                                       ┌───────────┐   ┌───────┐         │
+                                       │ Writeback │◀──│  LSQ  │◀────────┘
+                                       │   (ROB)   │   └───┬───┘
+                                       └───────────┘      │ req/resp
+                                                      ┌────▼───┐
+                                                      │ DCache │
+                                                      └────────┘
+
+  Branch prediction:  Fetch ─▶ Branch Pred ─▶ Decode (predictions);  Fetch ⇄ ICache
+  Queues:             FetchQueue & DecodeQueue buffer ICache→Decode and Decode→Rename
+                      (skipped when bypass_queues=true)
+  Wakeup / commit:    Execute & LSQ ─completion▶ Issue;  Execute & LSQ ─ROB complete▶ Writeback;
+                      Writeback ─commit▶ Rename
+  Branch resolve:     Execute ─resolved▶ Fetch, Issue, Writeback
+  Flush / redirect:   Branch Pred, Execute, Writeback ─▶ FlushArbiter ─▶ flush all stages,
+                      redirect Fetch
+  Memory hierarchy:   ICache ⇄ L2Cache ⇄ DCache   (L2 optional, disabled by default)
+  Execution engine:   ExecutionDriver (Whisper ISS) supplies functional results;
+                      PipelineClock ticks every stage (default 3 GHz)
 ```
 
 ### Pipeline Stages
@@ -289,8 +281,22 @@ make -C tests clean
 ```
 
 Built ELFs land in `tests/build/` (e.g. `tests/build/coremark.bare.elf`).
-Building them needs a bare-metal RISC-V toolchain (`riscv64-unknown-elf-gcc`);
-see `tests/install-toolchain-conda.sh`.
+
+Building the workloads requires the **bare-metal (newlib) RISC-V toolchain**
+`riscv64-unknown-elf-gcc`. A Linux/glibc cross-compiler such as
+`riscv64-unknown-linux-gnu-gcc` will **not** work — it emits glibc-linked code
+(unresolved `strcmp@GLIBC`, etc.) that cannot run on the bare-metal model.
+Install it into a Conda env named `riscv` and activate it before building:
+
+```bash
+bash tests/install-toolchain-conda.sh   # one-time: creates conda env 'riscv'
+conda activate riscv                     # puts riscv64-unknown-elf-gcc on PATH
+make -C tests run_coremark               # then build + run as above
+```
+
+The Makefile defaults `CC` to `riscv64-unknown-elf-gcc` (resolved from the
+activated env). For a toolchain installed elsewhere, override it:
+`make -C tests CC=/path/to/riscv64-unknown-elf-gcc`.
 
 ## Prerequisites
 
@@ -298,7 +304,7 @@ Run `bash scripts/build_scripts/setup_env.sh` to verify. You need:
 
 - **Build tools:** CMake >= 3.17, Make, g++-13 (C++23), git
 - **Libraries:** Boost >= 1.74, yaml-cpp >= 0.7, RapidJSON >= 1.1, SQLite3 >= 3.19, zlib, HDF5 >= 1.10
-- **Tests (optional):** bare-metal RISC-V toolchain `riscv64-unknown-elf-gcc` (see `tests/install-toolchain-conda.sh`)
+- **Tests (optional):** bare-metal (newlib) RISC-V toolchain `riscv64-unknown-elf-gcc`, installed via `tests/install-toolchain-conda.sh` (Conda env `riscv`). A glibc `*-linux-gnu-gcc` will not work.
 
 On Ubuntu 22.04:
 ```bash

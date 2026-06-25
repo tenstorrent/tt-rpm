@@ -85,6 +85,15 @@ for sub in whisper map; do
 done
 echo ""
 
+echo "Tests (optional — bare-metal RISC-V toolchain for tests/):"
+if command -v riscv64-unknown-elf-gcc &>/dev/null; then
+    echo -e "  ${GREEN}[OK]${NC} riscv64-unknown-elf-gcc  ($(riscv64-unknown-elf-gcc --version | head -1))"
+else
+    echo -e "  ${YELLOW}[OPTIONAL]${NC} riscv64-unknown-elf-gcc not found — needed only to build tests/ (CoreMark/Dhrystone)."
+    echo -e "             Install (newlib, not glibc): bash tests/install-toolchain-conda.sh && conda activate riscv"
+fi
+echo ""
+
 if [ "$ERRORS" -gt 0 ]; then
     echo -e "${RED}Found $ERRORS issue(s). Please resolve them before building.${NC}"
     exit 1
