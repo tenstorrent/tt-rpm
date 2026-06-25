@@ -141,9 +141,9 @@ A preset in-order config is at `models/cpu/src/core/config_inorder.yaml`:
     ┌───────┐   ┌────────┐   ┌────────┐   ┌────────┐   ┌───────┐   ┌─────────┐
     │ Fetch │──▶│ ICache │──▶│ Decode │──▶│ Rename │──▶│ Issue │──▶│ Execute │
     └───────┘◀──└────────┘   └────────┘   └────────┘   └───────┘   └────┬────┘
-                                                                 mem ops │
-                                       ┌───────────┐   ┌───────┐         │
-                                       │ Writeback │◀──│  LSQ  │◀────────┘
+                                                                mem ops │
+                                       ┌───────────┐   ┌───────┐        │
+                                       │ Writeback │◀──│  LSQ  │◀───────┘
                                        │   (ROB)   │   └───┬───┘
                                        └───────────┘       │ req/resp
                                                       ┌────▼───┐
