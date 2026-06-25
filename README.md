@@ -9,7 +9,12 @@ git clone <repository-url> rpm
 cd rpm
 git submodule update --init --recursive
 bash scripts/build_scripts/build_all.sh
-./build/core/core 500 tests/build/coremark.bare.elf
+
+# Test workloads are bare-metal RISC-V; install + activate the toolchain
+# (one-time), then build and run CoreMark to completion in the model:
+bash tests/install-toolchain-conda.sh   # creates conda env 'riscv'
+conda activate riscv
+make -C tests run_coremark
 ```
 
 Or via Docker (no local dependencies needed):
@@ -23,35 +28,23 @@ bash ci/docker_build.sh --test
 ### Basic Usage
 
 ```bash
-# ELF execution-driven (legacy positional syntax)
-./build/core/core 500 tests/build/coremark.bare.elf
+# Execution-driven: run an ELF to completion.
+# -i 0 = no instruction limit; the run ends when the program exits via HTIF "tohost".
+./build/core/core -i 0 -c models/cpu/src/core/config.yaml --target-elf tests/build/coremark.bare.elf
 
-# Named flags (equivalent)
-./build/core/core -r 500 -c models/cpu/src/core/config.yaml --target-elf tests/build/coremark.bare.elf
+# Or bound the run: -r is a tick budget (~3 ticks per cycle at 3 GHz).
+./build/core/core -r 2000000 -c models/cpu/src/core/config.yaml --target-elf tests/build/coremark.bare.elf
 ```
-
-### Whisper Traces
-
-```bash
-# Run a Whisper trace for up to 20M instructions (instruction limit with -i)
-./build/core/core -r 100000000 -i 20000000 \
-  -c models/cpu/src/core/config.yaml \
-  --trace-file /path/to/trace.csv.zst
-```
-
-The model derives the snapshot location from the trace filename and loads the
-corresponding Whisper memory/register snapshot.
 
 ### Key Command-Line Flags
 
 | Flag | Description |
 |------|-------------|
-| `-r CYCLES` | Run for up to CYCLES (default: 100) |
-| `-i INSTRS` | Stop after retiring INSTRS instructions (0 = no limit) |
+| `-r TICKS` | Run for up to TICKS (~3 ticks/cycle at 3 GHz; default: 100) |
+| `-i INSTRS` | Stop after retiring INSTRS instructions (0 = no limit; run to program exit) |
 | `--cpu-freq GHZ` | CPU clock frequency (default: 3.0 GHz) |
 | `-c CONFIG.yaml` | Load a Sparta config file |
 | `-p PATH VALUE` | Override a single parameter |
-| `--trace-file F` | Trace file (.csv.zst) for trace-driven mode |
 | `--target-elf F` | ELF binary for execution-driven mode |
 | `--report-all F` | Write all stats to file F after simulation |
 | `--show-tree` | Print the device tree |
@@ -62,21 +55,21 @@ Use `-l` to enable per-unit logging:
 
 ```bash
 # Log ExecutionDriver info messages
-./build/core/core -r 1000 --target-elf tests/build/coremark.bare.elf \
+./build/core/core -r 200000 --target-elf tests/build/coremark.bare.elf \
   -l top.core0.edriver info edriver.log
 
 # Log all writeback activity
-./build/core/core -r 1000 --target-elf tests/build/coremark.bare.elf \
+./build/core/core -r 200000 --target-elf tests/build/coremark.bare.elf \
   -l top.core0.writeback info wb.log
 ```
 
 ### Stats and Reports
 
 ```bash
-# Generate stats report
-./build/core/core -r 100000000 -i 1000000 \
+# Generate a stats report (run to completion, write all stats to a file)
+./build/core/core -i 0 \
   -c models/cpu/src/core/config.yaml \
-  --trace-file /path/to/trace.csv.zst \
+  --target-elf tests/build/coremark.bare.elf \
   --report-all stats.txt
 ```
 
@@ -86,11 +79,8 @@ pipeline counters, cache hit rates, and branch prediction accuracy.
 ### Using run_sim.sh
 
 ```bash
-# Trace-driven run
-bash scripts/run_scripts/run_sim.sh -m core -n 20000000 -t /path/to/trace.csv.zst
-
-# ELF execution-driven run
-bash scripts/run_scripts/run_sim.sh -m core -n 1000 -e tests/build/coremark.bare.elf
+# Execution-driven run (ELF); -n is a tick budget
+bash scripts/run_scripts/run_sim.sh -m core -n 2000000 -e tests/build/coremark.bare.elf
 ```
 
 Output is saved to `build/<model>/output/<timestamp>/`:
