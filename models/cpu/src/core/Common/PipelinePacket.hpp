@@ -48,7 +48,7 @@ static constexpr size_t kNumUopTypes = static_cast<size_t>(UopType::Fence) + 1;
 struct PipelinePacket {
     cpu::address_t pc{0};
     cpu::InstPtr inst{nullptr};
-    uint64_t tag{0};      // Whisper tag (may be reused after flush)
+    uint64_t tag{0};        // Whisper tag (may be reused after flush)
     uint64_t fetch_seq{0};  // Monotonic fetch-order id (never reused, globally unique)
     cpu::InstClass inst_class{cpu::InstClass::ALU};
     uint8_t size{4};              // instruction size in bytes (2 or 4 for RISC-V)

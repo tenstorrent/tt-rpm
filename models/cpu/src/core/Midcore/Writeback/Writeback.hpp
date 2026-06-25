@@ -93,8 +93,7 @@ class ReorderBuffer {
         while (count > 0) {
             core::ROBEntry& entry = mEntries[current];
 
-            bool squash = (req.branch_fetch_seq != 0) ? (entry.fetch_seq > req.branch_fetch_seq)
-                                                      : core::shouldSquash(entry.tag, entry.wrong_path_depth, req);
+            bool squash = (req.branch_fetch_seq != 0) ? (entry.fetch_seq > req.branch_fetch_seq) : core::shouldSquash(entry.tag, entry.wrong_path_depth, req);
             if (squash) {
                 // Release new_phys_dsts back to free list (not old_phys_dsts!)
                 for (const auto& ref : entry.new_phys_dsts) {

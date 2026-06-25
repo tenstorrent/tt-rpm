@@ -147,8 +147,7 @@ void PipelineClock::reportStats() {
 
     std::cerr << std::fixed << std::setprecision(3) << "\n=== Pipeline Stats @ cycle " << mCycle << " ===\n"
               << "  IPC:       " << ipc << "  heartbeat=" << hb_ipc << "  (retired=" << retired << ", cycles=" << mCycle << ")\n"
-              << "  Speed:     " << kips << " KIPS  " << khz << " KHz  (heartbeat: " << hb_kips << " KIPS  " << hb_khz
-              << " KHz, wall=" << elapsed_s << "s)\n"
+              << "  Speed:     " << kips << " KIPS  " << khz << " KHz  (heartbeat: " << hb_kips << " KIPS  " << hb_khz << " KHz, wall=" << elapsed_s << "s)\n"
               << "  Fetch:     fetched=" << mFetch->numFetched() << "  buffer_full_stall_cycles=" << mFetch->numBufferFullStallCycles() << "\n"
               << "  I-Cache:   hits=" << icHits << "  misses=" << icMisses << "  (hit_rate=" << icRate << "%)\n"
               << "  FetchQ:    enqueued=" << mFetchQueue->numEnqueued() << "  branch_wait_cycles=" << mFetchQueue->numBranchWaitCycles() << "\n"
@@ -185,8 +184,7 @@ void PipelineClock::deadlockDiag() {
     std::cerr << "  Execute: executed=" << mExecute->numExecuted() << "\n";
 
     // LSQ state
-    std::cerr << "  LSQ: loads=" << mLsq->numLoads() << " stores=" << mLsq->numStores()
-              << " completion_order=" << mLsq->numCompletionOrder() << "\n";
+    std::cerr << "  LSQ: loads=" << mLsq->numLoads() << " stores=" << mLsq->numStores() << " completion_order=" << mLsq->numCompletionOrder() << "\n";
 
     // Rename state
     std::cerr << "  Rename: dispatched=" << mRename->numDispatched() << " prf_stalls=" << mRename->numPrfStallCycles() << "\n";

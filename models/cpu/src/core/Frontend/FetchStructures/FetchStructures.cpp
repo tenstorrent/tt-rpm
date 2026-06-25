@@ -434,7 +434,7 @@ void FetchStructures::receiveMispredRedirect_(const core::BranchRedirect& redire
     // Refresh stale-redirect filter: any branch with fetch_seq < mFetchSeq is now invalid.
     mStaleFilter.squash_threshold_fetch_seq = mFetchSeq;
     if (redirect.wrong_path_depth == 0) {
-        mStaleFilter.depth0_fetch_seq = mFetchSeq;                       // upper bound: recovery frontier
+        mStaleFilter.depth0_fetch_seq = mFetchSeq;                         // upper bound: recovery frontier
         mStaleFilter.depth0_branch_fetch_seq = redirect.branch_fetch_seq;  // lower bound: recovering branch
     }
 

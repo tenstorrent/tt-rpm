@@ -723,8 +723,7 @@ void PipelineVisualizer::dumpKanata_(std::ostream& os) const {
 
     // Assign file ids in fetch-cycle order (Konata wants sequential ids).
     std::vector<uint64_t> order = mOrder;
-    std::stable_sort(order.begin(), order.end(),
-                     [&](uint64_t a, uint64_t b) { return mTraces.at(a).fetch < mTraces.at(b).fetch; });
+    std::stable_sort(order.begin(), order.end(), [&](uint64_t a, uint64_t b) { return mTraces.at(a).fetch < mTraces.at(b).fetch; });
 
     uint64_t fileId = 0;
     uint64_t retireId = 0;

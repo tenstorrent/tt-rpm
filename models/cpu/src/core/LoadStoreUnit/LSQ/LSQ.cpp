@@ -275,11 +275,12 @@ void LSQ::receiveFlush_(const core::FlushRequest& req) {
     for (auto it = mClaimedNotArrived.begin(); it != mClaimedNotArrived.end();) {
         // it->first is the claim's fetch_seq (monotonic, never reused): a claim fetched after
         // the resolving branch is on the squashed path even if its tag/depth no longer match.
-        bool squashed = core::shouldSquash(it->second.tag, it->second.depth, req) ||
-                        (req.branch_fetch_seq != 0 && it->first > req.branch_fetch_seq);
+        bool squashed = core::shouldSquash(it->second.tag, it->second.depth, req) || (req.branch_fetch_seq != 0 && it->first > req.branch_fetch_seq);
         if (squashed) {
-            if (it->second.is_store) returnStoreCredit();
-            else returnLoadCredit();
+            if (it->second.is_store)
+                returnStoreCredit();
+            else
+                returnLoadCredit();
             it = mClaimedNotArrived.erase(it);
         } else {
             ++it;

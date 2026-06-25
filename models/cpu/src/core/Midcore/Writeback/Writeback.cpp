@@ -99,8 +99,7 @@ void Writeback::receiveBranchResolved_(const core::BranchResolved& resolved) {
         bool younger = (resolved.branch_fetch_seq != 0) ? (entry.fetch_seq > resolved.branch_fetch_seq) : (entry.tag > resolved.branch_tag);
         if (younger && entry.wrong_path_depth > resolved.resolved_depth) {
             ILOG("[writeback] TRACE decrement tag=" << entry.tag << " depth " << static_cast<int>(entry.wrong_path_depth) << "->"
-                                                    << static_cast<int>(entry.wrong_path_depth - 1)
-                                                    << " (resolved branch_tag=" << resolved.branch_tag
+                                                    << static_cast<int>(entry.wrong_path_depth - 1) << " (resolved branch_tag=" << resolved.branch_tag
                                                     << " resolved_depth=" << static_cast<int>(resolved.resolved_depth) << ")");
             --entry.wrong_path_depth;
             ++num_decremented;
@@ -135,8 +134,7 @@ void Writeback::tick() {
         // instruction and redirect Fetch to the handler. Reuses the Execute flush
         // path (FlushArbiter::receiveExeFlush_) which flushes all stages and
         // redirects Fetch to target_pc.
-        if (mDriver && mLastRetiredTagValid && entry.wrong_path_depth == 0
-                && entry.pc != mDriver->expectedRetirePc()) {
+        if (mDriver && mLastRetiredTagValid && entry.wrong_path_depth == 0 && entry.pc != mDriver->expectedRetirePc()) {
             if (mTrapFlushSentTag != entry.tag) {
                 core::FlushRequest req;
                 req.source = core::FlushSource::Execute;
@@ -147,9 +145,8 @@ void Writeback::tick() {
                 req.branch_depth = 0;
                 trap_flush_out.send(req, 0);
                 mTrapFlushSentTag = entry.tag;
-                ILOG("[writeback] TRAP/INTERRUPT redirect: head tag=" << entry.tag << " pc=0x" << std::hex << entry.pc
-                                                                      << " != whisper pc=0x" << req.target_pc << std::dec
-                                                                      << " -- squashing fetch_seq>" << mLastRetiredFetchSeq
+                ILOG("[writeback] TRAP/INTERRUPT redirect: head tag=" << entry.tag << " pc=0x" << std::hex << entry.pc << " != whisper pc=0x" << req.target_pc
+                                                                      << std::dec << " -- squashing fetch_seq>" << mLastRetiredFetchSeq
                                                                       << " and redirecting fetch to handler");
             }
             break;
@@ -162,8 +159,8 @@ void Writeback::tick() {
             for (uint32_t i = 0; i < mRob.size(); ++i) {
                 uint32_t idx = (mRob.headIndex() + i) % mRob.capacity();
                 const auto& e = mRob.entryAt(idx);
-                ILOG("[writeback] TRACE   rob[" << i << "] tag=" << e.tag << " depth=" << static_cast<int>(e.wrong_path_depth)
-                                                << " completed=" << e.completed << " pc=0x" << std::hex << e.pc << std::dec);
+                ILOG("[writeback] TRACE   rob[" << i << "] tag=" << e.tag << " depth=" << static_cast<int>(e.wrong_path_depth) << " completed=" << e.completed
+                                                << " pc=0x" << std::hex << e.pc << std::dec);
             }
         }
         mLastRetiredTag = entry.tag;

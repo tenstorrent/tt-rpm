@@ -236,7 +236,7 @@ rpm/
 └── tests/                          # Bare-metal CoreMark / Dhrystone workloads
     ├── Makefile                    # Builds + runs the workloads in the core model
     ├── coremark/                   # CoreMark submodule (+ bare-metal patch)
-    └── riscv-tests/               # riscv-tests submodule (Dhrystone source)
+    └── riscv-tests/                # riscv-tests submodule (Dhrystone source)
 ```
 
 ## Build Scripts

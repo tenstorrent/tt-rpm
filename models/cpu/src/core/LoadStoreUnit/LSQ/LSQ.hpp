@@ -98,8 +98,7 @@ class LSQ : public sparta::Unit {
             lq_total += mLoadQueues[i]->size();
             sq_total += mStoreQueues[i]->size();
         }
-        os << "  LSQ diag: lq_occ=" << lq_total << " sq_occ=" << sq_total
-           << " load_credits=" << mLoadCredits << " store_credits=" << mStoreCredits
+        os << "  LSQ diag: lq_occ=" << lq_total << " sq_occ=" << sq_total << " load_credits=" << mLoadCredits << " store_credits=" << mStoreCredits
            << " completion_order=" << mCompletionOrder.size() << " load_completed_tags=" << mLoadCompletedTags.size()
            << " claimed_not_arrived=" << mClaimedNotArrived.size();
         if (!mCompletionOrder.empty()) {
@@ -142,16 +141,22 @@ class LSQ : public sparta::Unit {
     bool checkStoreForwarding(LoadQueue::Entry& load);
     void sampleOccupancyStats();
 
-    void returnLoadCredit() { if (mLoadCredits < mLoadCreditCap) ++mLoadCredits; }
-    void returnStoreCredit() { if (mStoreCredits < mStoreCreditCap) ++mStoreCredits; }
+    void returnLoadCredit() {
+        if (mLoadCredits < mLoadCreditCap) ++mLoadCredits;
+    }
+    void returnStoreCredit() {
+        if (mStoreCredits < mStoreCreditCap) ++mStoreCredits;
+    }
     // Returns true if a live claim existed (and consumes it). False means a flush already
     // refunded this op's credit (it was squashed in flight) -- the caller must not enqueue it.
     bool claimArrived_(uint64_t fetch_seq) { return mClaimedNotArrived.erase(fetch_seq) > 0; }
     void claimSquashed_(uint64_t fetch_seq) {
         auto it = mClaimedNotArrived.find(fetch_seq);
         if (it == mClaimedNotArrived.end()) return;
-        if (it->second.is_store) returnStoreCredit();
-        else returnLoadCredit();
+        if (it->second.is_store)
+            returnStoreCredit();
+        else
+            returnLoadCredit();
         mClaimedNotArrived.erase(it);
     }
 

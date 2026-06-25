@@ -5,8 +5,8 @@
 #include "Common/SpeculationConfig.hpp"
 #include "Common/SpeculationUtils.hpp"
 #include "Frontend/DecodeQueue/DecodeQueue.hpp"
-#include "Logging.hpp"
 #include "LoadStoreUnit/LSQ/LSQ.hpp"
+#include "Logging.hpp"
 #include "Midcore/Execute/Execute.hpp"
 #include "Midcore/Issue/Issue.hpp"
 #include "Midcore/Writeback/Writeback.hpp"
@@ -208,8 +208,10 @@ uint32_t Rename::tickOoo_() {
         mDownstream->reserveSlot(dp.uop_type);
 
         // Claim the LSQ credit now that the uop is committed to dispatch.
-        if (mLsq && is_mem_load) mLsq->claimLoad(dp.pkt.fetch_seq, dp.pkt.tag, dp.pkt.wrong_path_depth);
-        else if (mLsq && is_mem_store) mLsq->claimStore(dp.pkt.fetch_seq, dp.pkt.tag, dp.pkt.wrong_path_depth);
+        if (mLsq && is_mem_load)
+            mLsq->claimLoad(dp.pkt.fetch_seq, dp.pkt.tag, dp.pkt.wrong_path_depth);
+        else if (mLsq && is_mem_store)
+            mLsq->claimStore(dp.pkt.fetch_seq, dp.pkt.tag, dp.pkt.wrong_path_depth);
 
         core::RenamedPacket rpkt;
         rpkt.pkt = dp.pkt;
@@ -341,8 +343,10 @@ uint32_t Rename::tickInorder_() {
 
         mDownstreamExecute->reserveSlot(dp.uop_type);
 
-        if (mLsq && is_mem_load) mLsq->claimLoad(dp.pkt.fetch_seq, dp.pkt.tag, dp.pkt.wrong_path_depth);
-        else if (mLsq && is_mem_store) mLsq->claimStore(dp.pkt.fetch_seq, dp.pkt.tag, dp.pkt.wrong_path_depth);
+        if (mLsq && is_mem_load)
+            mLsq->claimLoad(dp.pkt.fetch_seq, dp.pkt.tag, dp.pkt.wrong_path_depth);
+        else if (mLsq && is_mem_store)
+            mLsq->claimStore(dp.pkt.fetch_seq, dp.pkt.tag, dp.pkt.wrong_path_depth);
 
         core::IssuePacket ipkt;
         ipkt.pkt = dp.pkt;

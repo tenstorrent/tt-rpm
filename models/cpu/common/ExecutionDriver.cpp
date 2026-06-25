@@ -236,10 +236,8 @@ bool ExecutionDriver::isSerializing(const std::shared_ptr<TT_PERF::InstrPac> &pa
     // must resync the pipeline. Otherwise a younger FP op executes speculatively with
     // the stale rounding mode and trips whisper's exec-vs-retire check at retire.
     static const std::set<unsigned> non_spec_resync_csrs = {
-        unsigned(CN::FRM),   unsigned(CN::FCSR),  unsigned(CN::FFLAGS),
-        unsigned(CN::VSTART), unsigned(CN::VL),   unsigned(CN::VTYPE),
-        unsigned(CN::VLENB), unsigned(CN::VCSR),  unsigned(CN::VXRM),
-        unsigned(CN::VXSAT),
+        unsigned(CN::FRM),   unsigned(CN::FCSR),  unsigned(CN::FFLAGS), unsigned(CN::VSTART), unsigned(CN::VL),
+        unsigned(CN::VTYPE), unsigned(CN::VLENB), unsigned(CN::VCSR),   unsigned(CN::VXRM),   unsigned(CN::VXSAT),
     };
     const WdRiscv::DecodedInst &di = pacPtr->decodedInst();
     if (di.instEntry() != nullptr) {
@@ -337,8 +335,7 @@ InstPtr ExecutionDriver::peekInstruction(address_t fetchPc, bool onSpeculativePa
         if (onSpeculativePath) {
             mDriverInvalidState = true;
             mInvalidStateTag = instId;
-            ILOG("[peekInstruction] Speculative serializing inst InstId=" << instId
-                                                                          << " -- arming driver invalid state, stopping wrong-path fetch past it");
+            ILOG("[peekInstruction] Speculative serializing inst InstId=" << instId << " -- arming driver invalid state, stopping wrong-path fetch past it");
         }
     }
 
