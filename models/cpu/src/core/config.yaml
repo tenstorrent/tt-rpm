@@ -1,0 +1,136 @@
+# Sparta-native parameter config for the core CPU model.
+# Paths match the tree structure: top.core0.<unit>.params.<param>
+# Auto-applied by CommandLineSimulator via -c flag.
+
+top.core0:
+  params:
+    ooo_enabled: true
+    # Wrong-path speculation configuration
+    wrong_path_enabled: false          # Master switch for speculative execution on mispredicted paths
+    wrong_path_max_depth: 8            # Max nested speculation levels
+    bypass_queues: false               # Bypass FetchQueue/DecodeQueue (simpler bring-up for wrong-path)
+    visualizer_enabled: false
+    visualizer_max_instructions: 20000
+    visualizer_format: table
+    visualizer_output_file: pipeline.txt
+    visualizer_color: false
+    visualizer_streaming: false            # Stream events immediately (for crash debugging)
+    visualizer_debug_enabled: true         # Enable per-cycle debug output (helpful for deadlock debugging)
+    visualizer_debug_file: pipeline_debug.txt  # Debug output file
+    visualizer_debug_start_cycle: 0        # First cycle to output (0 = start from beginning)
+    visualizer_debug_end_cycle: 0          # Last cycle to output (0 = unlimited)
+    cache_viewer_enabled: false
+    cache_viewer_format: log
+    cache_viewer_output_file: stderr
+  fetch:
+    params:
+      initial_pc: 2147483648
+      fetch_width: 16
+      fetch_buffer_capacity: 64
+  icache:
+    params:
+      cache_mode: structural
+      hit_rate: 0.9                    # (probabilistic mode only)
+      hit_latency: 1
+      miss_latency: 10
+      mshr_capacity: 2
+      cache_size_kb: 256               # (structural mode)
+      cache_line_size: 64              # (structural mode)
+      cache_associativity: 4           # (structural mode)
+      replacement_policy: lru          # (structural mode)
+      rng_seed: 0xCAFE                 # (probabilistic mode only)
+  fetch_queue:
+    params:
+      capacity: 16
+      log_enabled: false
+  decode:
+    params:
+      lat_alu: 1
+      lat_mul: 3
+      lat_div: 12
+      lat_branch: 1
+      lat_load: 1
+      lat_store: 1
+      lat_fp: 4
+      lat_vec: 4
+      lat_fence: 1
+      bp_mispred_penalty: 15
+  decode_queue:
+    params:
+      capacity: 32
+      log_enabled: false
+  branch_predictor:
+    params:
+      accuracy: 0.9  # 95% accuracy - was 0 which caused spurious mispredictions
+  rename:
+    params:
+      dispatch_width: 4
+      num_phys_regs: 128
+      freelist_headroom: 8
+      ooo_enabled: true
+      regfile_banking_enabled: false
+      regfile_num_banks: 4
+      regfile_reads_per_bank: 2
+      regfile_writes_per_bank: 1
+      max_branch_checkpoints: 32       # Max in-flight branch checkpoints for misprediction recovery
+      log_enabled: false
+  issue:
+    params:
+      mode: unified
+      speculative_wakeup: false
+      selection: age_matrix
+      issue_queue_capacity: 32
+      issue_width: 8
+      num_phys_regs: 128
+      bypass_network_enabled: false
+      bypass_regfile_read_latency: 1
+  execute:
+    params:
+      granularity: typed
+      unified_max_in_flight: 8
+      int_max_in_flight: 6
+      fp_max_in_flight: 2
+      vec_max_in_flight: 2
+      branch_max_in_flight: 2
+      write_port_mode: unified
+      write_port_count: 4
+      writeback_buffer_enabled: false
+      writeback_buffer_capacity: 16
+      writeback_buffer_drain_width: 4
+      writeback_buffer_latency: 1
+  lsq:
+    params:
+      load_queue_capacity: 32
+      store_queue_capacity: 24
+      store_forwarding: false
+      forwarding_latency: 1
+      num_banks: 1
+  dcache:
+    params:
+      cache_mode: structural
+      hit_rate: 1.0                    # (probabilistic mode only)
+      hit_latency: 1
+      miss_latency: 10
+      mshr_capacity: 16
+      cache_size_kb: 64                # (structural mode)
+      cache_line_size: 64              # (structural mode)
+      cache_associativity: 8           # (structural mode)
+      replacement_policy: lru          # (structural mode)
+      store_buffer_capacity: 8         # Store buffer entries
+      write_policy: write_back         # write_back | write_through
+      num_banks: 1                     # Number of banks
+      reads_per_bank_per_cycle: 1      # Read ports per bank
+      writes_per_bank_per_cycle: 1     # Write ports per bank
+      fill_occupies_write_port: false  # Fills use write port
+      rng_seed: 0xDEAD                 # (probabilistic mode only)
+  writeback:
+    params:
+      retire_width: 4
+      rob_capacity: 128
+      log_enabled: false
+  flush_arbiter:
+    params:
+      log_enabled: false               # Enable debug logging for flush coordination
+  l2cache:
+    params:
+      enabled: false

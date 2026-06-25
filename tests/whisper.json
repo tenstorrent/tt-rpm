@@ -1,0 +1,20 @@
+{
+    "xlen": 64,
+    "isa": "rv64imac",
+    "enable_misaligned_data": "true",
+    "memmap": {
+        "inst": [["0x80000000", "0x801fffff"]],
+        "pma": [
+            {
+                "low": "0x80000000",
+                "high": "0x801fffff",
+                "attribs": ["read", "write", "exec", "amo", "rsrv", "idempotent"]
+            },
+            {
+                "low": "0x0",
+                "high": "0xffffffffffffffff",
+                "attribs": ["read", "write", "amo", "rsrv", "idempotent"]
+            }
+        ]
+    }
+}

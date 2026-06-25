@@ -1,0 +1,5 @@
+- config_name: core_baseline
+  model: core
+  config_files:
+    - config.yaml
+  num_instructions: 1000000

@@ -1,0 +1,214 @@
+diff --git a/barebones/core_portme.c b/barebones/core_portme.c
+index 30112ff..6e420d5 100644
+--- a/barebones/core_portme.c
++++ b/barebones/core_portme.c
+@@ -44,8 +44,12 @@ volatile ee_s32 seed5_volatile = 0;
+ CORETIMETYPE
+ barebones_clock()
+ {
+-#error \
+-    "You must implement a method to measure time in barebones_clock()! This function should return current time.\n"
++    /* Read the machine cycle counter (mcycle, 0xB00). The RPM model has no timer
++       peripheral or OS clock. We use mcycle rather than the user 'cycle' CSR
++       because the latter traps without mcounteren/privilege setup. */
++    ee_u32 cycles;
++    __asm__ volatile("csrr %0, mcycle" : "=r"(cycles));
++    return cycles;
+ }
+ /* Define : TIMER_RES_DIVIDER
+         Divider to trade off timer resolution and total time that can be
+@@ -55,6 +59,11 @@ barebones_clock()
+    does not occur. If there are issues with the return value overflowing,
+    increase this value.
+         */
++#ifndef CLOCKS_PER_SEC
++/* Only converts mcycle counts -> seconds for the reported score; the figure is
++   informational (CoreMark validates via CRCs, not wall-clock time). */
++#define CLOCKS_PER_SEC 1000000000
++#endif
+ #define GETMYTIME(_t)              (*_t = barebones_clock())
+ #define MYTIMEDIFF(fin, ini)       ((fin) - (ini))
+ #define TIMER_RES_DIVIDER          1
+@@ -129,9 +138,8 @@ ee_u32 default_num_contexts = 1;
+ void
+ portable_init(core_portable *p, int *argc, char *argv[])
+ {
+-#error \
+-    "Call board initialization routines in portable init (if needed), in particular initialize UART!\n"
+-
++    /* No board init needed: console output goes through the HTIF "tohost" byte
++       (see uart_send_char in ee_printf.c); timing is the mcycle CSR. */
+     (void)argc; // prevent unused warning
+     (void)argv; // prevent unused warning
+ 
+diff --git a/barebones/core_portme.h b/barebones/core_portme.h
+index b221363..c9d261b 100644
+--- a/barebones/core_portme.h
++++ b/barebones/core_portme.h
+@@ -21,6 +21,7 @@ Original Author: Shay Gal-on
+ */
+ #ifndef CORE_PORTME_H
+ #define CORE_PORTME_H
++#include <stddef.h> /* size_t for ee_size_t (freestanding build) */
+ /************************/
+ /* Data types and settings */
+ /************************/
+@@ -90,7 +91,10 @@ typedef signed int     ee_s32;
+ typedef double         ee_f32;
+ typedef unsigned char  ee_u8;
+ typedef unsigned int   ee_u32;
+-typedef ee_u32         ee_ptr_int;
++/* Pointer-holding integer: must match pointer width. This is RV64 (lp64), so
++   pointers are 64-bit -- ee_u32 here would truncate addresses (align_mem) and
++   trip portable_init's "define ee_ptr_int" check. */
++typedef unsigned long  ee_ptr_int;
+ typedef size_t         ee_size_t;
+ #define NULL ((void *)0)
+ /* align_mem :
+@@ -166,7 +170,7 @@ typedef ee_u32 CORE_TICKS;
+    greater then 1.
+ */
+ #ifndef MAIN_HAS_NOARGC
+-#define MAIN_HAS_NOARGC 0
++#define MAIN_HAS_NOARGC 1
+ #endif
+ 
+ /* Configuration : MAIN_HAS_NORETURN
+diff --git a/barebones/crt0.S b/barebones/crt0.S
+new file mode 100644
+index 0000000..f57a2f7
+--- /dev/null
++++ b/barebones/crt0.S
+@@ -0,0 +1,43 @@
++# Minimal bare-metal startup for CoreMark on the RPM core model.
++# No OS, no syscalls. Set up gp/sp, clear .bss, call main(), then exit via the
++# HTIF "tohost" protocol. Console output also goes through tohost (see
++# ee_printf.c). The model routes tohost stores to stdout / sim-stop.
++
++    .section .text.init, "ax"
++    .global _start
++_start:
++    .option push
++    .option norelax
++    la      gp, __global_pointer$
++    .option pop
++
++    la      sp, _stack_top
++
++    # zero .bss
++    la      t0, __bss_start
++    la      t1, __bss_end
++1:
++    bgeu    t0, t1, 2f
++    sd      zero, 0(t0)
++    addi    t0, t0, 8
++    j       1b
++2:
++    call    main
++
++    # exit: write 1 to HTIF tohost (dev=0,cmd=0,payload odd) -> sim stop.
++    la      t0, tohost
++    li      t1, 1
++    sd      t1, 0(t0)
++3:
++    j       3b
++
++    # HTIF mailbox. Whisper looks these up by symbol name ("tohost"/"fromhost").
++    .section .tohost, "aw", @progbits
++    .align 6
++    .global tohost
++tohost:
++    .dword 0
++    .align 6
++    .global fromhost
++fromhost:
++    .dword 0
+diff --git a/barebones/ee_printf.c b/barebones/ee_printf.c
+index f2d362d..0232e47 100644
+--- a/barebones/ee_printf.c
++++ b/barebones/ee_printf.c
+@@ -659,23 +659,19 @@ ee_vsprintf(char *buf, const char *fmt, va_list args)
+     return str - buf;
+ }
+ 
++/* Output via the HTIF "tohost" syscall protocol (spike/riscv-pk convention),
++   which the RPM perf model routes to stdout: PerfApi::commitMemoryWrite() sees
++   a store to the tohost address and calls Hart::handleStoreToHost(), which for
++   dev=1/cmd=1 writes the low byte to stdout. tohost is a normal 8-byte store to
++   a tracked address (defined in crt0.S), so it avoids the zero-size store path
++   that the __whisper_console_io MMIO byte would hit. */
++extern volatile unsigned long tohost;
++
+ void
+ uart_send_char(char c)
+ {
+-#error "You must implement the method uart_send_char to use this file!\n";
+-    /*	Output of a char to a UART usually follows the following model:
+-            Wait until UART is ready
+-            Write char to UART
+-            Wait until UART is done
+-
+-            Or in code:
+-            while (*UART_CONTROL_ADDRESS != UART_READY);
+-            *UART_DATA_ADDRESS = c;
+-            while (*UART_CONTROL_ADDRESS != UART_READY);
+-
+-            Check the UART sample code on your platform or the board
+-       documentation.
+-    */
++    /* (dev=1 << 56) | (cmd=1 << 48) | byte */
++    tohost = (1UL << 56) | (1UL << 48) | (unsigned long)(unsigned char)c;
+ }
+ 
+ int
+diff --git a/barebones/link.ld b/barebones/link.ld
+new file mode 100644
+index 0000000..7cdeca1
+--- /dev/null
++++ b/barebones/link.ld
+@@ -0,0 +1,45 @@
++/* Bare-metal layout for the RPM core model.
++ * Everything lives in the executable region based at 0x80000000
++ * (matches the exec PMA region in tests/whisper.json). */
++OUTPUT_ARCH(riscv)
++ENTRY(_start)
++
++SECTIONS
++{
++    . = 0x80000000;
++
++    .text : {
++        *(.text.init)
++        *(.text .text.*)
++    }
++
++    .rodata : {
++        *(.rodata .rodata.*)
++        *(.srodata .srodata.*)
++    }
++
++    . = ALIGN(8);
++    .data : {
++        *(.data .data.*)
++        . = ALIGN(8);
++        __global_pointer$ = . + 0x800;
++        *(.sdata .sdata.*)
++    }
++
++    . = ALIGN(8);
++    .bss (NOLOAD) : {
++        __bss_start = .;
++        *(.sbss .sbss.*)
++        *(.bss .bss.*)
++        *(COMMON)
++        . = ALIGN(8);
++        __bss_end = .;
++    }
++
++    /* 256 KB stack */
++    . = ALIGN(16);
++    . = . + 0x40000;
++    _stack_top = .;
++
++    .tohost : { *(.tohost) }
++}

@@ -1,0 +1,27 @@
+# Example RPM experiment config consumed by scripts/run_scripts/slurm/run.py.
+#
+# The file is a YAML list; each entry describes one experiment that will be
+# swept across every benchmark / workload selected on the command line.
+#
+# Fields:
+#   config_name:       short identifier; becomes a directory name in the study
+#   model:             which built binary to run (build/<model>/<model>)
+#   config_files:      optional list of -c CONFIG files (resolved relative to
+#                      the binary's cwd inside the study)
+#   model_options:     optional list of extra CLI tokens passed verbatim
+#   num_cycles:        tick budget (-r N); mutually exclusive with num_instructions
+#   num_instructions:  retire budget (-i N); mutually exclusive with num_cycles
+
+- config_name: core_baseline
+  model: core
+  config_files:
+    - config.yaml
+  num_cycles: 20000000
+
+- config_name: core_wide
+  model: core
+  config_files:
+    - config.yaml
+  model_options:
+    - "-p top.core0.writeback.params.retire_width 8"
+  num_cycles: 20000000

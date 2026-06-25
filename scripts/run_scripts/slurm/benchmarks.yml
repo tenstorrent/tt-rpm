@@ -1,0 +1,25 @@
+# Benchmark registry for the RPM Slurm runner.
+#
+# Each top-level key is a benchmark name referenced by run.py --benchmarks.
+# An entry simply names a directory of workloads, behaving like --elf-dir /
+# --trace-dir but under a reusable name.
+#
+# Fields:
+#   type:  'elf'   -> passed to the model as --target-elf  (execution-driven)
+#          'trace' -> passed to the model as --trace-file  (trace-driven)
+#   path:  absolute or RPM-root-relative directory containing workload files
+#   glob:  filename pattern to discover workload files inside `path`
+#
+# Point `path` at your own workload directories and add as many entries as you
+# need.
+
+microbench:
+  type: elf
+  path: tests/programs
+  glob: "*.elf"
+
+# Example trace set (uncomment and edit `path` to point at your own traces):
+# my_traces:
+#   type: trace
+#   path: /path/to/traces/
+#   glob: "*-trace.csv.zst"

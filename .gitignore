@@ -1,0 +1,23 @@
+# Build outputs
+build*
+*.o
+*.a
+
+# IDE
+.vscode/
+
+# Simulation outputs
+out*.txt
+ilog*.txt
+*.log
+*.ansi
+*.ans
+pipeline*.txt
+
+# Python
+__pycache__/
+*.pyc
+out.txt
+ilog.txt
+
+.cursor/

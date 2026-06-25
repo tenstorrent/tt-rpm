@@ -1,0 +1,88 @@
+# In-order configuration — same as config.yaml but with ooo_enabled=false.
+
+top.core0:
+  params:
+    ooo_enabled: false
+  fetch:
+    params:
+      initial_pc: 2147483648
+      fetch_width: 16
+      bp_mispred_penalty: 5
+      fetch_buffer_capacity: 64
+  icache:
+    params:
+      cache_mode: probabilistic
+      hit_rate: 0.9
+      hit_latency: 1
+      miss_latency: 10
+      mshr_capacity: 2
+  decode:
+    params:
+      lat_alu: 1
+      lat_mul: 3
+      lat_div: 12
+      lat_branch: 1
+      lat_load: 1
+      lat_store: 1
+      lat_fp: 4
+      lat_vec: 4
+      lat_fence: 1
+  branch_predictor:
+    params:
+      accuracy: 0.95
+  rename:
+    params:
+      buffer_capacity: 16
+      dispatch_width: 4
+      num_phys_regs: 128
+      freelist_headroom: 8
+      ooo_enabled: false
+  issue:
+    params:
+      mode: unified
+      speculative_wakeup: false
+      selection: age_matrix
+      issue_queue_capacity: 32
+      issue_width: 8
+      num_phys_regs: 128
+  execute:
+    params:
+      granularity: typed
+      unified_max_in_flight: 8
+      int_max_in_flight: 6
+      fp_max_in_flight: 2
+      vec_max_in_flight: 2
+      branch_max_in_flight: 2
+  lsq:
+    params:
+      load_queue_capacity: 32
+      store_queue_capacity: 24
+      store_forwarding: false
+      forwarding_latency: 1
+      num_banks: 1
+  dcache:
+    params:
+      cache_mode: probabilistic
+      hit_rate: 1.0
+      hit_latency: 1
+      miss_latency: 10
+      mshr_capacity: 16
+  writeback:
+    params:
+      retire_width: 4
+      rob_capacity: 128
+
+extensions:
+  write_ports:
+    mode: unified
+    num_ports: 4
+  bypass_network:
+    enabled: false
+  writeback_buffer:
+    enabled: false
+  regfile:
+    banking_enabled: false
+  visualizer:
+    enabled: false
+  cache_viewer:
+    enabled: false

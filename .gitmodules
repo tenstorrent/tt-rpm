@@ -1,0 +1,16 @@
+[submodule "whisper"]
+	path = ext/whisper
+	url = https://github.com/tenstorrent/whisper.git
+[submodule "map"]
+	path = ext/map
+	url = https://github.com/sparcians/map
+	branch = map_v2
+[submodule "ext/konata"]
+	path = ext/konata
+	url = https://github.com/shioyadan/Konata.git
+[submodule "tests/coremark"]
+	path = tests/coremark
+	url = https://github.com/eembc/coremark.git
+[submodule "tests/riscv-tests"]
+	path = tests/riscv-tests
+	url = https://github.com/riscv-software-src/riscv-tests.git

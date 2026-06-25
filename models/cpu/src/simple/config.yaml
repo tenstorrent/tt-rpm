@@ -1,0 +1,20 @@
+# simple model configuration
+# Instruction size in bytes (sequential fetch increment; default 4).
+instr_size: 4
+
+# Optional: path to ELF for ExecutionDriver/Whisper (if set, fetch is driven by Whisper ISS).
+# Build test ELFs: make -C tests/programs
+target_command: ""
+
+# Stage widths (instructions/ops per cycle). Uneven values model superscalar bottlenecks.
+fetch_width: 4    # instructions fetched per cycle
+decode_width: 4   # instructions decode can accept/send per cycle
+ls_width: 4       # load/store ops (and mem requests) per cycle
+
+# Load ports: max memory requests in flight per level (1 or 2 typical).
+l1_load_ports: 4
+l2_load_ports: 4
+dram_load_ports: 4
+
+architectural_register_file_size: 32
+physical_register_file_size: 512

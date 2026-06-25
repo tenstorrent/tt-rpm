@@ -1,0 +1,47 @@
+---
+Checks: "clang-analyzer-*,
+    bugprone-*,
+    cppcoreguidelines-*,
+    modernize-*,
+    performance-*,
+    readability-*,
+    misc-redundant-expression,
+    misc-reorder-init-list,
+    -bugprone-easily-swappable-parameters,
+    -bugprone-macro-parentheses,
+    -modernize-use-auto,
+    -modernize-use-nodiscard,
+    -modernize-use-trailing-return-type,
+    -modernize-macro-to-enum,
+    -modernize-avoid-c-arrays,
+    -modernize-pass-by-value,
+    -cppcoreguidelines-avoid-magic-numbers,
+    -cppcoreguidelines-macro-to-enum,
+    -cppcoreguidelines-avoid-c-arrays,
+    -cppcoreguidelines-owning-memory,
+    -cppcoreguidelines-non-private-member-variables-in-classes,
+    -cppcoreguidelines-avoid-const-or-ref-data-members,
+    -cppcoreguidelines-macro-usage,
+    -readability-braces-around-statements,
+    -readability-function-cognitive-complexity,
+    -readability-function-size,
+    -readability-identifier-length,
+    -readability-isolate-declaration,
+    -readability-magic-numbers,
+    -readability-suspicious-call-argument,
+    -readability-uppercase-literal-suffix,
+    -readability-convert-member-functions-to-static,
+    -readability-avoid-unconditional-preprocessor-if,
+    -readability-else-after-return,
+    -readability-simplify-boolean-expr,
+    -readability-make-member-function-const,
+    -performance-enum-size"
+CheckOptions:
+  - key: readability-implicit-bool-conversion.AllowIntegerConditions
+    value: true
+  - key: readability-implicit-bool-conversion.AllowPointerConditions
+    value: true
+
+HeaderFilterRegex: '.*/(cpu|cluster)/.*'
+UseColor: true
+FormatStyle: 'file'
