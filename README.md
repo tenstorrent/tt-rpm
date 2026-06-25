@@ -134,34 +134,40 @@ A preset in-order config is at `models/cpu/src/core/config_inorder.yaml`:
 ## Pipeline Architecture
 
 ```
-                                Core Pipeline (core0)
+                                      RPM Architecture (core0)
 
-  Main dataflow (in-order front end, out-of-order back end):
+                    ┌────┐
+               ┌───▶│ I$ │───┐
+    ┌────┐     │    └────┘   │   ┌────┐   ┌────┐   ┌────┐   ┌────┐   ┌────┐
+    │ F  │─────┤             ├──▶│ D  │──▶│ Rn │──▶│ Is │──▶│ Ex │──▶│ Wb │
+    └────┘     │    ┌────┐   │   └────┘   └────┘   └────┘   └─┬──┘   └────┘
+               └───▶│BPU │───┘                                │
+                    └────┘                                    ▼
+                                                           ┌─────┐   ┌────┐
+                                                           │ LSQ │──▶│ D$ │
+                                                           └─────┘   └────┘
 
-    ┌───────┐   ┌────────┐   ┌────────┐   ┌────────┐   ┌───────┐   ┌─────────┐
-    │ Fetch │──▶│ ICache │──▶│ Decode │──▶│ Rename │──▶│ Issue │──▶│ Execute │
-    └───────┘◀──└────────┘   └────────┘   └────────┘   └───────┘   └────┬────┘
-                                                                mem ops │
-                                       ┌───────────┐   ┌───────┐        │
-                                       │ Writeback │◀──│  LSQ  │◀───────┘
-                                       │   (ROB)   │   └───┬───┘
-                                       └───────────┘       │ req/resp
-                                                      ┌────▼───┐
-                                                      │ DCache │
-                                                      └────────┘
+  Stages:    F   Fetch (PC-select mux, steered by redirects)
+             I$  L1 instruction cache
+             BPU branch prediction unit (F drives I$ and BPU in parallel; both feed D)
+             D   Decode
+             Rn  Rename (allocates from the physical register file, PRF)
+             Is  Issue — age-ordered issue queue, ready bits, load balancing, spec wakeup
+             Ex  Execute (functional units)
+             Wb  Writeback / ROB (in-order retire)
+             LSQ load/store queue (memory ops only)
+             D$  L1 data cache
 
-  Branch prediction:  Fetch ─▶ Branch Pred ─▶ Decode (predictions);  Fetch ⇄ ICache
-  Queues:             FetchQueue & DecodeQueue buffer ICache→Decode and Decode→Rename
-                      (skipped when bypass_queues=true)
-  Wakeup / commit:    Execute & LSQ ─▶ Issue;  Execute & LSQ ─▶ Writeback;
-                      Writeback ─▶ Rename
-  Branch resolve:     Execute ─▶ Fetch, Issue, Writeback
-  Flush / redirect:   Branch Pred, Execute, Writeback ─▶ FlushArbiter ─▶ flush all stages,
-                      redirect Fetch
-  Memory hierarchy:   L1 ICache and L1 DCache each fill from a shared L2Cache
-                      (L2 optional, disabled by default)
-  Execution engine:   ExecutionDriver (Whisper ISS) supplies functional results;
-                      PipelineClock ticks every stage (default 3 GHz)
+  Data flow: F ─▶ {I$, BPU} ─▶ D ─▶ Rn ─▶ Is ─▶ Ex ─▶ Wb
+             memory ops: Ex ─▶ LSQ ─▶ D$
+  Queues:    FetchQueue / DecodeQueue buffer I$→D and D→Rn (skipped when bypass_queues=true)
+  Feedback:  execution results write back to the PRF (Rn)
+             LSQ ⇄ ROB for memory completion/ordering
+             branch resolution / flushes (Ex, Wb, via the FlushArbiter) redirect F's PC mux
+             Wb ─▶ Rn commits / frees registers
+  Memory:    L1 I$ and L1 D$ each fill from a shared L2 cache (optional, off by default)
+  Engine:    ExecutionDriver (Whisper ISS) supplies functional results
+             PipelineClock ticks every stage (default 3 GHz).
 ```
 
 ### Pipeline Stages
