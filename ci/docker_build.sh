@@ -39,12 +39,14 @@ case "$ACTION" in
         ;;
     --test)
         "${DOCKER_RUN[@]}" bash -c "\
+            git config --global --add safe.directory '*' && \
             git submodule update --init --recursive && \
             bash scripts/build_scripts/build_all.sh && \
             make -C tests run_coremark"
         ;;
     build|*)
         "${DOCKER_RUN[@]}" bash -c "\
+            git config --global --add safe.directory '*' && \
             git submodule update --init --recursive && \
             bash scripts/build_scripts/build_all.sh"
         ;;
