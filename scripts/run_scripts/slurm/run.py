@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Submit RPM simulation jobs to a Slurm cluster as an array of tasks.
 
 Given one or more experiment config files and a set of benchmarks, this tool

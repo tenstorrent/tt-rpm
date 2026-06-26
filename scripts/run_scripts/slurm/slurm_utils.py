@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Thin wrappers around the Slurm CLI used by the RPM runner.
 
 All functions shell out to squeue / sbatch / scontrol rather than linking to a

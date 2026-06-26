@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Aggregate RPM Slurm study results into CSVs.
 
 Given a study directory produced by scripts/run_scripts/slurm/run.py, this

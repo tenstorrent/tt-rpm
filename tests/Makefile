@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Build bare-metal CoreMark/Dhrystone for the RPM core model and run them.
 #
 # No kernel exists, so workloads are built bare-metal (crt0 + linker script at

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # simple model configuration
 # Instruction size in bytes (sequential fetch increment; default 4).
 instr_size: 4

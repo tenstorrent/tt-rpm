@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # FindSparta.cmake — locate a pre-built Sparta installation inside the RPM tree.
 #
 # Sets:

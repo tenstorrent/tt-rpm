@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # In-order preset for the core CPU model.
 # Identical to config.yaml but with out-of-order execution disabled
 # (ooo_enabled: false). Paths match the tree: top.core0.<unit>.params.<param>
