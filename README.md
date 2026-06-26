@@ -25,8 +25,8 @@ Highlights:
 ## Quick Start
 
 ```bash
-git clone git@github.com:tenstorrent/tt-rpm.git rpm
-cd rpm
+git clone git@github.com:tenstorrent/tt-rpm.git
+cd tt-rpm
 git submodule update --init --recursive
 
 # Build the dependencies + models with your host compiler. (The bare-metal test
