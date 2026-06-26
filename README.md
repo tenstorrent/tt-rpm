@@ -25,7 +25,7 @@ Highlights:
 ## Quick Start
 
 ```bash
-git clone <repository-url> rpm
+git clone git@github.com:tenstorrent/tt-rpm.git rpm
 cd rpm
 git submodule update --init --recursive
 
