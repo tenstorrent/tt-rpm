@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Example RPM experiment config consumed by scripts/run_scripts/slurm/run.py.
 #
 # The file is a YAML list; each entry describes one experiment that will be

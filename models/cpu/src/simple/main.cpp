@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+
 #include "sparta/app/Simulation.hpp"
 #include "sparta/app/SimulationConfiguration.hpp"
 #include "sparta/kernel/Scheduler.hpp"

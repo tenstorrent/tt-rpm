@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+
 #include "MemoryHierarchy/L2Cache.hpp"
 
 #include "Logging.hpp"

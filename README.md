@@ -2,6 +2,26 @@
 
 A cycle-level RISC-V CPU performance simulation framework built on [Sparta](https://github.com/sparcians/map) (MAP) and [Whisper](https://github.com/tenstorrent/whisper) ISS.
 
+## Overview
+
+RPM is an execution-driven, cycle-level performance model for RISC-V cores. It
+pairs a configurable, event-driven pipeline (built on the Sparta modeling
+framework) with the Whisper instruction set simulator for functional execution,
+letting you study microarchitectural trade-offs and measure performance on real
+bare-metal workloads such as CoreMark and Dhrystone.
+
+Highlights:
+
+- **Configurable pipeline** — in-order or out-of-order execution, selectable
+  issue policies, execute granularity, write-port arbitration, and bypass paths,
+  all driven from YAML config.
+- **Execution-driven** — Whisper supplies functional results, so the model runs
+  real ELF binaries to completion.
+- **Modeled memory hierarchy** — probabilistic or detailed L1 I$/D$ and an
+  optional unified L2.
+- **Observability** — per-unit logging, stats reports, and Konata pipeline
+  visualization.
+
 ## Quick Start
 
 ```bash
@@ -340,3 +360,25 @@ git submodule update --init --recursive
 | `ext/map` | [Sparta/MAP](https://github.com/sparcians/map) — simulation framework (branch: `map_v2`) |
 | `ext/whisper` | [Whisper](https://github.com/tenstorrent/whisper) — RISC-V ISS for execution driving |
 | `ext/konata` | Konata pipeline viewer |
+
+## Contributing
+
+Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for
+build setup, coding conventions (including the required SPDX license headers),
+and the pull-request process. All participants are expected to follow our
+[Code of Conduct](CODE_OF_CONDUCT.md).
+
+## Security
+
+To report a security vulnerability, please follow the process described in
+[SECURITY.md](SECURITY.md). Do not open public issues for security reports.
+
+## License
+
+This project is licensed under the Apache License, Version 2.0. See
+[LICENSE](LICENSE) for the full text and [NOTICE](NOTICE) for attribution of
+third-party components. See also [LICENSE_understanding.txt](LICENSE_understanding.txt).
+
+The dependencies under `ext/` and the benchmark/test suites under `tests/`
+(CoreMark, riscv-tests) are third-party components included as git submodules
+and remain under their own respective licenses.

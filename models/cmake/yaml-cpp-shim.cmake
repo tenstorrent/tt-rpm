@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Shim for yaml-cpp 0.7 compatibility.
 # yaml-cpp 0.7 (Ubuntu 22.04) exports only "yaml-cpp" as a target name.
 # yaml-cpp 0.8+ exports the namespaced "yaml-cpp::yaml-cpp".
