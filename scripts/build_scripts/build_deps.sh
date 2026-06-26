@@ -10,6 +10,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RPM_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 JOBS=$(nproc 2>/dev/null || echo 4)
+# Cap parallelism by available memory.
+# Default to at most one job per 2 GB of total RAM.
+if MEM_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null) && [ -n "${MEM_KB:-}" ]; then
+    MEM_JOBS=$(( MEM_KB / 1024 / 1024 / 2 ))
+    [ "$MEM_JOBS" -lt 1 ] && MEM_JOBS=1
+    [ "$JOBS" -gt "$MEM_JOBS" ] && JOBS="$MEM_JOBS"
+fi
 CLEAN=0
 BUILD_TYPE="Release"
 
