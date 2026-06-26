@@ -56,17 +56,15 @@ to the file's comment syntax.
 For C++ source and header files (`.cpp`, `.hpp`, `.h`):
 
 ```cpp
-// SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
-//
 // SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 ```
 
 For Python, shell, CMake, and YAML files:
 
 ```python
-# SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
-#
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 ```
 
 For shell and Python scripts that begin with a `#!` shebang line, place the
