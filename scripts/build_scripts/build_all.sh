@@ -34,8 +34,18 @@ echo "[Step 4/5] Building all models..."
 echo ""
 
 echo "[Step 5/5] Building test workloads..."
-if ! make -C "$RPM_ROOT/tests" all; then
-    echo "  (skipped: bare-metal RISC-V toolchain required; see tests/install-toolchain-conda.sh)" >&2
+# The workloads are bare-metal RISC-V and need the (optional) newlib cross
+# toolchain. Build them only if it's on PATH; otherwise skip cleanly so a fresh
+# clone without the toolchain still finishes build_all without a confusing error.
+if command -v "${CC:-riscv64-unknown-elf-gcc}" >/dev/null 2>&1; then
+    make -C "$RPM_ROOT/tests" all
+else
+    echo "  Skipped: bare-metal RISC-V toolchain (riscv64-unknown-elf-gcc) not on PATH."
+    echo "  Deps and models built fine. To build the test workloads, install the"
+    echo "  toolchain once and build the tests separately:"
+    echo "    bash tests/install-toolchain-conda.sh   # creates conda env 'riscv'"
+    echo "    conda activate riscv"
+    echo "    make -C tests"
 fi
 echo ""
 

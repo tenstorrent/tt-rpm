@@ -28,10 +28,14 @@ Highlights:
 git clone <repository-url> rpm
 cd rpm
 git submodule update --init --recursive
+
+# Build the dependencies + models with your host compiler. (The bare-metal test
+# workloads are skipped here unless the RISC-V toolchain is already on PATH.)
 bash scripts/build_scripts/build_all.sh
 
-# Test workloads are bare-metal RISC-V; install + activate the toolchain
-# (one-time), then build and run CoreMark to completion in the model:
+# Then build + run the bare-metal RISC-V test workloads. Install the toolchain
+# in its own conda env (one-time) and activate it *after* the host build above,
+# so it doesn't shadow the host g++/cmake. Run CoreMark to completion:
 bash tests/install-toolchain-conda.sh   # creates conda env 'riscv'
 conda activate riscv
 make -C tests run_coremark
