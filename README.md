@@ -71,7 +71,7 @@ bash ci/docker_build.sh --test
 | `-p PATH VALUE` | Override a single parameter |
 | `--target-elf F` | ELF binary for execution-driven mode |
 | `--report-all F` | Write all stats to file F after simulation |
-| `--show-tree` | Print the device tree |
+| `--show-tree` | Print the Sparta resource and parameter tree (units + their config params) |
 
 ### Logging
 
