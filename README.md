@@ -251,10 +251,10 @@ rpm/
 │   │   └── src/
 │   │       ├── core/               # Configurable in-order / OOO core model
 │   │       └── simple/             # Minimal single-cycle CPU model
-│   ├── cluster/                    # Cluster-level models
-│   ├── fabric/                     # Interconnect fabric
-│   ├── memory_model/               # Memory subsystem model
-│   └── soc/                        # SoC-level model
+│   ├── cluster/                    # (reserved for future expansion) cluster-level models
+│   ├── fabric/                     # (reserved for future expansion) interconnect fabric
+│   ├── memory_model/               # (reserved for future expansion) memory subsystem model
+│   └── soc/                        # (reserved for future expansion) SoC-level model
 │
 ├── scripts/                        # Build, run & analysis scripts
 │   ├── build_scripts/
