@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 
-# SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
-#
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 
 # Check C++ formatting against the repo's .clang-format config.
 # Returns non-zero if any file needs reformatting.

@@ -1,6 +1,5 @@
-# SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
-#
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 
 # Build bare-metal CoreMark/Dhrystone for the RPM core model and run them.
 #

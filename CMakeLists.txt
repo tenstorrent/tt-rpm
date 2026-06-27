@@ -1,6 +1,5 @@
-# SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
-#
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 
 cmake_minimum_required(VERSION 3.17)
 project(rpm LANGUAGES CXX)

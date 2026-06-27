@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 
-# SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
-#
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 
 # Install 64-bit RISC-V toolchain via Conda (no sudo). Creates env 'riscv' and installs riscv-tools.
 # Run from this directory. Requires conda (miniconda or anaconda).

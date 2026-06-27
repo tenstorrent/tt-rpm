@@ -1,6 +1,5 @@
-# SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
-#
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 
 # In-order preset for the core CPU model.
 # Identical to config.yaml but with out-of-order execution disabled

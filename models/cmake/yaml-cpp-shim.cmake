@@ -1,6 +1,5 @@
-# SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
-#
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 
 # Shim for yaml-cpp 0.7 compatibility.
 # yaml-cpp 0.7 (Ubuntu 22.04) exports only "yaml-cpp" as a target name.
