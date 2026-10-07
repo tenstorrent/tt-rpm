@@ -374,6 +374,30 @@ git submodule update --init --recursive
 | `ext/whisper` | [Whisper](https://github.com/tenstorrent/whisper) — RISC-V ISS for execution driving |
 | `ext/konata` | Konata pipeline viewer |
 
+## Publication
+
+RPM was presented at the Open-Source Computer Architecture Research
+([OSCAR](https://oscar-workshop.github.io/Program_2026.html)) workshop,
+co-located with ISCA 2026 (June 28, 2026, Raleigh, NC, USA):
+
+> Sahil Gandhi, Hieu Mai, Anirudh Jain, Jiyong Yu and Vignyan Kothinti.
+> **RPM: RISC-V Performance Model.** OSCAR Workshop at ISCA 2026.
+> [[Poster presentation](https://oscar-workshop.github.io/files/P_7_RPM.pdf)]
+
+If you use RPM in your research, please cite:
+
+```bibtex
+@inproceedings{rpm-oscar2026,
+  title     = {{RPM}: {RISC-V} Performance Model},
+  author    = {Gandhi, Sahil and Mai, Hieu and Jain, Anirudh and Yu, Jiyong and Kothinti, Vignyan},
+  booktitle = {Open-Source Computer Architecture Research (OSCAR) Workshop, co-located with ISCA 2026},
+  address   = {Raleigh, NC, USA},
+  month     = jun,
+  year      = {2026},
+  url       = {https://github.com/tenstorrent/tt-rpm}
+}
+```
+
 ## Contributing
 
 Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for
