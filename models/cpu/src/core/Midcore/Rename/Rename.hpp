@@ -314,6 +314,13 @@ class Rename : public sparta::Unit {
     uint64_t numPrfStallCycles() const { return mNumPrfStallCycles.get(); }
     uint64_t numCheckpointStallCycles() const { return mNumCheckpointStallCycles.get(); }
 
+    // Top-down slot accounting (see accountSlots_)
+    uint64_t topdownSlots() const { return mTopdownSlots.get(); }
+    // Includes the slots of a bubble that has not ended yet
+    uint64_t topdownFrontendBoundSlots() const { return mTopdownFrontendBoundSlots.get() + mBubbleSlots; }
+    uint64_t topdownRecoverySlots() const { return mTopdownRecoverySlots.get(); }
+    uint64_t topdownBackendBoundSlots() const { return mTopdownBackendBoundSlots.get(); }
+
     PhysicalRegisterFile& getPrf() { return mPrf; }
     const PhysicalRegisterFile& getPrf() const { return mPrf; }
     CheckpointManager& getCheckpointManager() { return mCheckpointMgr; }
@@ -328,6 +335,32 @@ class Rename : public sparta::Unit {
 
     uint32_t tickOoo_();
     uint32_t tickInorder_();
+
+    // Why dispatch stopped before filling all dispatch_width slots in a cycle.
+    enum class DispatchStall : uint8_t {
+        None,              // all slots used
+        Frontend,          // no more uops delivered by the frontend
+        PrfFull,           // not enough free physical registers
+        RobFull,           // ROB full
+        SchedulerFull,     // issue scheduler (OOO) or execute group (in-order) full
+        LoadQueueFull,     // no load-queue credit
+        StoreQueueFull,    // no store-queue credit
+        CheckpointFull,    // no free branch checkpoint
+        OperandsNotReady,  // in-order: source operands not ready
+    };
+
+    // Top-down accounting at the dispatch stage. Every cycle contributes
+    // dispatch_width slots. Slots not used by a dispatched uop are attributed to
+    // the backend when a backend resource stopped dispatch. Slots left empty
+    // because no uop was delivered ("bubbles") are attributed when the bubble
+    // ends: to bad speculation (recovery) when the uop that ends it is the first
+    // one after a misprediction stall or a pipeline flush, and to the frontend
+    // otherwise.
+    void accountSlots_(uint32_t dispatched, DispatchStall stall);
+    void endBubble_(bool recovery);
+    bool isMemoryStall_(DispatchStall stall) const;
+
+    void simulationTerminating_() override;
 
     // Packet source for dispatch: the DecodeQueue, or mPendingPackets in direct mode.
     bool hasPendingPacket_() const;
@@ -360,6 +393,14 @@ class Rename : public sparta::Unit {
     // Speculation depth tracking (for visualization/debugging)
     uint8_t mCurrentWrongPathDepth{0};
 
+    // Reason the current cycle's dispatch stopped (set by tickOoo_/tickInorder_)
+    DispatchStall mDispatchStall{DispatchStall::None};
+    // Empty slots of the current bubble, not yet attributed (see accountSlots_)
+    uint64_t mBubbleSlots{0};
+    uint64_t mBubbleLatencySlots{0};  // ... of which in cycles with no uop dispatched
+    // A flush was received: the bubble ended by the next dispatched uop is recovery
+    bool mRecoveryPending{false};
+
     core::PipelineVisualizer* mVis{nullptr};
 
     std::vector<core::RenamedPacket> mRenamedBuf;
@@ -369,6 +410,24 @@ class Rename : public sparta::Unit {
     sparta::Counter mNumDispatched;
     sparta::Counter mNumPrfStallCycles;
     sparta::Counter mNumCheckpointStallCycles;
+
+    // Top-down slot counters
+    sparta::Counter mTopdownCycles;
+    sparta::Counter mTopdownSlots;
+    sparta::Counter mTopdownFrontendBoundSlots;
+    sparta::Counter mTopdownFrontendLatencySlots;
+    sparta::Counter mTopdownRecoverySlots;
+    sparta::Counter mTopdownBackendBoundSlots;
+    sparta::Counter mTopdownBackendMemorySlots;
+
+    // Cycles in which dispatch stopped early, by backend resource
+    sparta::Counter mStallRobFull;
+    sparta::Counter mStallPrfFull;
+    sparta::Counter mStallSchedulerFull;
+    sparta::Counter mStallLoadQueueFull;
+    sparta::Counter mStallStoreQueueFull;
+    sparta::Counter mStallCheckpointFull;
+    sparta::Counter mStallOperandsNotReady;
 };
 
 }  // namespace midcore

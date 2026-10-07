@@ -97,6 +97,7 @@ class DecodeStructures : public sparta::Unit {
 
     uint32_t mMispredPenalty{5};
     uint32_t mMispredStall{0};
+    bool mRestartAfterMispredStall{false};  // Tag the next delivered uop as ending a misprediction stall
     bool mDirectMode{false};
 
     sparta::Counter mNumDecoded;

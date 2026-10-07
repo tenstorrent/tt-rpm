@@ -77,6 +77,7 @@ struct DecodePacket {
     uint8_t latency{1};
     bool predicted_taken{false};
     bool was_mispredicted{false};
+    bool after_mispredict_stall{false};  // First uop Decode delivered after a misprediction stall (top-down accounting)
 };
 
 // Token returned by the ROB on allocate — carries both slot index and epoch

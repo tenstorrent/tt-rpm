@@ -100,6 +100,60 @@ Use `-l` to enable per-unit logging:
 Key stats include: `num_retired`, IPC (from heartbeat output), fetch/decode/issue/execute/writeback
 pipeline counters, cache hit rates, and branch prediction accuracy.
 
+### Top-Down Analysis
+
+The core model classifies every dispatch slot (cycles × `rename` `dispatch_width`)
+at the rename stage, which separates the frontend from the backend, following
+the top-down method:
+
+| Category | Slots |
+|----------|-------|
+| **Retiring** | Used by instructions that retired |
+| **Bad Speculation** | Used by instructions that were squashed (*wasted work*), or left empty while recovering from a misprediction or pipeline flush (*recovery*) |
+| **Frontend Bound** | Left empty because the frontend delivered no instruction: in cycles with nothing dispatched (*latency*) or with some instructions dispatched (*bandwidth*) |
+| **Backend Bound** | Lost because a backend resource stopped dispatch: a full load/store queue or a load waiting for data at the ROB head (*memory*), or any other resource (*core*) |
+
+A run of empty slots is attributed when it ends: to recovery when the next
+instruction is the first one after a misprediction stall or a pipeline flush,
+and to the frontend otherwise. The four level-1 categories add up to 100%.
+
+The level-1 breakdown is printed with the stats summary (`TopDown:` line). For
+the full breakdown, run `scripts/parse_scripts/topdown.py` on a stats report:
+
+```bash
+./build/core/core -i 0 -c models/cpu/src/core/config.yaml \
+  --target-elf tests/build/coremark.bare.elf --report-all stats.txt
+python3 scripts/parse_scripts/topdown.py stats.txt
+```
+
+```
+stats.txt [top.core0]
+  cycles=379,388  instructions=678,351  IPC=1.788  dispatch_width=4
+    Retiring              44.70%  #############.................
+    Bad Speculation       24.64%  #######.......................
+      Wasted Work          0.00%
+      Recovery            24.64%
+    Frontend Bound         0.35%  ..............................
+      Latency              0.20%
+      Bandwidth            0.15%
+    Backend Bound         30.31%  #########.....................
+      Memory Bound        12.75%
+      Core Bound          17.56%
+  Dispatch stall cycles by backend resource (% of cycles):
+    ...
+  Events per 1000 instructions:
+    ...
+```
+
+`topdown.py` accepts text and JSON reports (optionally `.bz2`) and directories,
+which it searches for `*.json` / `*.json.bz2` reports, e.g. a Slurm study
+directory; `--csv FILE` writes one row per run. The underlying counters are the
+`topdown_*` and `dispatch_stall_*` statistics of `top.core0.rename`.
+
+With `wrong_path_enabled: false`, wrong-path instructions are never fetched and
+the misprediction penalty is a Decode stall, so mispredictions show up as
+recovery slots only.
+
 ### Using run_sim.sh
 
 ```bash

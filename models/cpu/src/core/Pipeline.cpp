@@ -3,6 +3,7 @@
 
 #include "Pipeline.hpp"
 
+#include <algorithm>
 #include <iomanip>
 #include <iostream>
 
@@ -166,6 +167,17 @@ void PipelineClock::reportStats() {
         std::cerr << "  L2-Cache:  hits=" << l2Hits << "  misses=" << l2Misses << "  (hit_rate=" << l2Rate << "%)\n";
     }
     std::cerr << "  Writeback: retired=" << retired << "\n";
+
+    // Top-down level 1, cumulative. Dispatched uops that did not retire, plus
+    // recovery bubbles, are bad speculation (see Rename::accountSlots_).
+    const uint64_t slots = mRename->topdownSlots();
+    if (slots > 0) {
+        const double total = static_cast<double>(slots);
+        const uint64_t wasted = mRename->numDispatched() - std::min(retired, mRename->numDispatched());
+        std::cerr << "  TopDown:   retiring=" << 100.0 * retired / total << "%  bad_spec=" << 100.0 * (wasted + mRename->topdownRecoverySlots()) / total
+                  << "%  frontend=" << 100.0 * mRename->topdownFrontendBoundSlots() / total
+                  << "%  backend=" << 100.0 * mRename->topdownBackendBoundSlots() / total << "%\n";
+    }
 }
 
 void PipelineClock::deadlockDiag() {

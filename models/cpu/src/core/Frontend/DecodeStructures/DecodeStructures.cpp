@@ -140,6 +140,7 @@ void DecodeStructures::tick() {
         ILOG("[decode] mispred stall, " << mMispredStall << " cycle(s) remaining");
         --mMispredStall;
         ++mNumMispredStallCycles;
+        mRestartAfterMispredStall = true;
         return;
     }
 
@@ -208,6 +209,8 @@ void DecodeStructures::tick() {
                 dp.was_mispredicted = false;
             }
 
+            dp.after_mispredict_stall = mRestartAfterMispredStall;
+            mRestartAfterMispredStall = false;
             mDecodePacketsBuf.push_back(dp);
         }
     } else {
@@ -246,6 +249,8 @@ void DecodeStructures::tick() {
                 }
             }
 
+            dp.after_mispredict_stall = mRestartAfterMispredStall;
+            mRestartAfterMispredStall = false;
             mDecodePacketsBuf.push_back(dp);
         }
     }

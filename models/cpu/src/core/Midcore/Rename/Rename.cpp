@@ -25,7 +25,34 @@ Rename::Rename(sparta::TreeNode* node, const RenameParams* params)
       mLogEnabled(params->log_enabled),
       mNumDispatched(&unit_stat_set_, "num_dispatched", "Total instructions dispatched", sparta::Counter::COUNT_NORMAL),
       mNumPrfStallCycles(&unit_stat_set_, "num_prf_stall_cycles", "Cycles stalled on register hazards", sparta::Counter::COUNT_NORMAL),
-      mNumCheckpointStallCycles(&unit_stat_set_, "num_checkpoint_stall_cycles", "Cycles stalled on checkpoint hazards", sparta::Counter::COUNT_NORMAL) {
+      mNumCheckpointStallCycles(&unit_stat_set_, "num_checkpoint_stall_cycles", "Cycles stalled on checkpoint hazards", sparta::Counter::COUNT_NORMAL),
+      mTopdownCycles(&unit_stat_set_, "topdown_cycles", "Cycles covered by top-down slot accounting", sparta::Counter::COUNT_NORMAL),
+      mTopdownSlots(&unit_stat_set_, "topdown_slots", "Dispatch slots (cycles x dispatch_width)", sparta::Counter::COUNT_NORMAL),
+      mTopdownFrontendBoundSlots(&unit_stat_set_, "topdown_frontend_bound_slots", "Slots not filled because the frontend delivered no uop (outside recovery)",
+                                 sparta::Counter::COUNT_NORMAL),
+      mTopdownFrontendLatencySlots(&unit_stat_set_, "topdown_frontend_latency_slots", "Frontend-bound slots in cycles in which no uop was delivered",
+                                   sparta::Counter::COUNT_NORMAL),
+      mTopdownRecoverySlots(&unit_stat_set_, "topdown_recovery_slots", "Slots not filled while recovering from a misprediction or pipeline flush",
+                            sparta::Counter::COUNT_NORMAL),
+      mTopdownBackendBoundSlots(&unit_stat_set_, "topdown_backend_bound_slots", "Slots not filled because a backend resource stalled dispatch",
+                                sparta::Counter::COUNT_NORMAL),
+      mTopdownBackendMemorySlots(&unit_stat_set_, "topdown_backend_memory_slots",
+                                 "Backend-bound slots attributed to memory (load/store queue full or an incomplete load at the ROB head)",
+                                 sparta::Counter::COUNT_NORMAL),
+      mStallRobFull(&unit_stat_set_, "dispatch_stall_rob_full", "Cycles dispatch stopped early because the ROB was full", sparta::Counter::COUNT_NORMAL),
+      mStallPrfFull(&unit_stat_set_, "dispatch_stall_prf_full", "Cycles dispatch stopped early for lack of free physical registers",
+                    sparta::Counter::COUNT_NORMAL),
+      mStallSchedulerFull(&unit_stat_set_, "dispatch_stall_scheduler_full",
+                          "Cycles dispatch stopped early because the issue scheduler (OOO) or execute group (in-order) was full",
+                          sparta::Counter::COUNT_NORMAL),
+      mStallLoadQueueFull(&unit_stat_set_, "dispatch_stall_load_queue_full", "Cycles dispatch stopped early for lack of a load-queue entry",
+                          sparta::Counter::COUNT_NORMAL),
+      mStallStoreQueueFull(&unit_stat_set_, "dispatch_stall_store_queue_full", "Cycles dispatch stopped early for lack of a store-queue entry",
+                           sparta::Counter::COUNT_NORMAL),
+      mStallCheckpointFull(&unit_stat_set_, "dispatch_stall_checkpoint_full", "Cycles dispatch stopped early for lack of a branch checkpoint",
+                           sparta::Counter::COUNT_NORMAL),
+      mStallOperandsNotReady(&unit_stat_set_, "dispatch_stall_operands_not_ready",
+                             "Cycles in-order dispatch stopped early because source operands were not ready", sparta::Counter::COUNT_NORMAL) {
     commit_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(Rename, receiveCommits_, std::vector<core::PhysRegRef>));
     completion_exe_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(Rename, receiveCompletions_, std::vector<core::PhysRegRef>));
     completion_lsq_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(Rename, receiveCompletions_, std::vector<core::PhysRegRef>));
@@ -77,6 +104,11 @@ void Rename::receiveFlush_(const core::FlushRequest& req) {
         ILOG("[rename] No checkpoint found for branch_tag=" << req.branch_tag);
     }
 
+    // The bubble before the flush is charged to the frontend; the bubble until the
+    // first post-flush uop is dispatched is recovery.
+    endBubble_(false);
+    mRecoveryPending = true;
+
     // Release all checkpoints for younger branches
     mCheckpointMgr.releaseYoungerThan(req.branch_tag);
 
@@ -126,9 +158,15 @@ bool Rename::isReady() const {
 
 void Rename::tick() {
     if (mDirectMode) {
-        if (mPendingPackets.empty()) return;
+        if (mPendingPackets.empty()) {
+            accountSlots_(0, DispatchStall::Frontend);
+            return;
+        }
     } else {
-        if (!mDecodeQueue || mDecodeQueue->isEmpty()) return;
+        if (!mDecodeQueue || mDecodeQueue->isEmpty()) {
+            accountSlots_(0, DispatchStall::Frontend);
+            return;
+        }
     }
 
     uint32_t dispatched = 0;
@@ -142,6 +180,74 @@ void Rename::tick() {
         ++mNumPrfStallCycles;
     } else {
         mNumDispatched += dispatched;
+    }
+
+    accountSlots_(dispatched, mDispatchStall);
+}
+
+bool Rename::isMemoryStall_(DispatchStall stall) const {
+    if (stall == DispatchStall::LoadQueueFull || stall == DispatchStall::StoreQueueFull) return true;
+    // The oldest instruction is a load still waiting for its data
+    return mRob && !mRob->empty() && !mRob->headCompleted() && mRob->head().uop_type == core::UopType::Load;
+}
+
+void Rename::endBubble_(bool recovery) {
+    if (recovery) {
+        mTopdownRecoverySlots += mBubbleSlots;
+    } else {
+        mTopdownFrontendBoundSlots += mBubbleSlots;
+        mTopdownFrontendLatencySlots += mBubbleLatencySlots;
+    }
+    mBubbleSlots = 0;
+    mBubbleLatencySlots = 0;
+    mRecoveryPending = false;
+}
+
+void Rename::simulationTerminating_() {
+    // A bubble still open at the end of the run is charged to the frontend
+    endBubble_(false);
+}
+
+void Rename::accountSlots_(uint32_t dispatched, DispatchStall stall) {
+    ++mTopdownCycles;
+    mTopdownSlots += mDispatchWidth;
+    if (dispatched >= mDispatchWidth) return;
+
+    const uint32_t lost = mDispatchWidth - dispatched;
+    if (stall == DispatchStall::None || stall == DispatchStall::Frontend) {
+        mBubbleSlots += lost;
+        if (dispatched == 0) mBubbleLatencySlots += lost;
+        return;
+    }
+
+    mTopdownBackendBoundSlots += lost;
+    if (isMemoryStall_(stall)) mTopdownBackendMemorySlots += lost;
+
+    switch (stall) {
+        case DispatchStall::RobFull:
+            ++mStallRobFull;
+            break;
+        case DispatchStall::PrfFull:
+            ++mStallPrfFull;
+            break;
+        case DispatchStall::SchedulerFull:
+            ++mStallSchedulerFull;
+            break;
+        case DispatchStall::LoadQueueFull:
+            ++mStallLoadQueueFull;
+            break;
+        case DispatchStall::StoreQueueFull:
+            ++mStallStoreQueueFull;
+            break;
+        case DispatchStall::CheckpointFull:
+            ++mStallCheckpointFull;
+            break;
+        case DispatchStall::OperandsNotReady:
+            ++mStallOperandsNotReady;
+            break;
+        case DispatchStall::None:
+        case DispatchStall::Frontend:
+            break;
     }
 }
 
@@ -180,6 +286,7 @@ void Rename::extractRegOperands_(const core::DecodePacket& dp, std::vector<core:
 uint32_t Rename::tickOoo_() {
     mRenamedBuf.clear();
     uint32_t dispatched = 0;
+    mDispatchStall = DispatchStall::None;
 
     while (dispatched < mDispatchWidth && hasPendingPacket_()) {
         const auto* peek = peekPacket_();
@@ -189,26 +296,43 @@ uint32_t Rename::tickOoo_() {
         std::vector<core::RegOperand> dst_regs;
         extractRegOperands_(*peek, src_regs, dst_regs);
 
-        if (!mPrf.canAllocate(dst_regs)) break;
-        if (mRob && !mRob->canAllocate()) break;
-        if (!mDownstream->isReadyForType(peek->uop_type)) break;
+        if (!mPrf.canAllocate(dst_regs)) {
+            mDispatchStall = DispatchStall::PrfFull;
+            break;
+        }
+        if (mRob && !mRob->canAllocate()) {
+            mDispatchStall = DispatchStall::RobFull;
+            break;
+        }
+        if (!mDownstream->isReadyForType(peek->uop_type)) {
+            mDispatchStall = DispatchStall::SchedulerFull;
+            break;
+        }
 
         // Stall dispatch when no LQ/SQ credit is available so memory-op occupancy stays bounded.
         const bool is_mem_load = (peek->uop_type == core::UopType::Load);
         const bool is_mem_store = (peek->uop_type == core::UopType::Store);
-        if (mLsq && is_mem_load && !mLsq->canClaimLoad()) break;
-        if (mLsq && is_mem_store && !mLsq->canClaimStore()) break;
+        if (mLsq && is_mem_load && !mLsq->canClaimLoad()) {
+            mDispatchStall = DispatchStall::LoadQueueFull;
+            break;
+        }
+        if (mLsq && is_mem_store && !mLsq->canClaimStore()) {
+            mDispatchStall = DispatchStall::StoreQueueFull;
+            break;
+        }
 
         // Check if branch needs checkpoint and if we have capacity
         bool is_branch = (peek->uop_type == core::UopType::Branch);
         bool need_checkpoint = is_branch && core::getSpeculationConfig().enabled;
         if (need_checkpoint && !mCheckpointMgr.canAllocate()) {
             ++mNumCheckpointStallCycles;
+            mDispatchStall = DispatchStall::CheckpointFull;
             break;
         }
 
         // Pull the packet
         auto dp = pullPacket_();
+        endBubble_(mRecoveryPending || dp.after_mispredict_stall);
 
         // Reserve slot to prevent over-dispatching in same cycle
         mDownstream->reserveSlot(dp.uop_type);
@@ -296,6 +420,7 @@ uint32_t Rename::tickOoo_() {
 uint32_t Rename::tickInorder_() {
     mIssuedBuf.clear();
     uint32_t dispatched = 0;
+    mDispatchStall = DispatchStall::None;
 
     while (dispatched < mDispatchWidth && hasPendingPacket_()) {
         const auto* peek = peekPacket_();
@@ -305,18 +430,34 @@ uint32_t Rename::tickInorder_() {
         std::vector<core::RegOperand> dst_regs;
         extractRegOperands_(*peek, src_regs, dst_regs);
 
-        if (!mDownstreamExecute->isReadyForType(peek->uop_type)) break;
-        if (!mArchScoreboard.sourcesReady(src_regs)) break;
-        if (mRob && !mRob->canAllocate()) break;
+        if (!mDownstreamExecute->isReadyForType(peek->uop_type)) {
+            mDispatchStall = DispatchStall::SchedulerFull;
+            break;
+        }
+        if (!mArchScoreboard.sourcesReady(src_regs)) {
+            mDispatchStall = DispatchStall::OperandsNotReady;
+            break;
+        }
+        if (mRob && !mRob->canAllocate()) {
+            mDispatchStall = DispatchStall::RobFull;
+            break;
+        }
 
         // Stall dispatch when no LQ/SQ credit is available so memory-op occupancy stays bounded.
         const bool is_mem_load = (peek->uop_type == core::UopType::Load);
         const bool is_mem_store = (peek->uop_type == core::UopType::Store);
-        if (mLsq && is_mem_load && !mLsq->canClaimLoad()) break;
-        if (mLsq && is_mem_store && !mLsq->canClaimStore()) break;
+        if (mLsq && is_mem_load && !mLsq->canClaimLoad()) {
+            mDispatchStall = DispatchStall::LoadQueueFull;
+            break;
+        }
+        if (mLsq && is_mem_store && !mLsq->canClaimStore()) {
+            mDispatchStall = DispatchStall::StoreQueueFull;
+            break;
+        }
 
         // Pull the packet
         auto dp = pullPacket_();
+        endBubble_(mRecoveryPending || dp.after_mispredict_stall);
 
         mDownstreamExecute->reserveSlot(dp.uop_type);
 
