@@ -6,8 +6,7 @@
 """Top-down performance breakdown of RPM core-model runs.
 
 Reads the Sparta statistics report of a run (`--report-all FILE` in text form,
-or `--report-all FILE json`, optionally bzip2-compressed as written by the
-Slurm runner) and prints the top-down breakdown of every core in it:
+or `--report-all FILE json`, optionally bzip2-compressed) and prints the top-down breakdown of every core in it:
 
     Retiring           uops that retired
     Bad Speculation    uops dispatched but squashed, plus dispatch slots lost

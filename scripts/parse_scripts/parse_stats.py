@@ -11,7 +11,7 @@ Usage:
     python3 parse_stats.py <output_dir>          # run_sim.sh output dir; reads its ilog.txt
 
 The helpers parse_retire_lines / parse_setup_time / extract_stats can also be
-imported and called with an arbitrary line iterator (see parse_slurm_results.py).
+imported and called with an arbitrary line iterator.
 """
 
 import argparse

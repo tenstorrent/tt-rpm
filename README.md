@@ -149,7 +149,7 @@ stats.txt [top.core0]
 ```
 
 `topdown.py` accepts text and JSON reports (optionally `.bz2`) and directories,
-which it searches for `*.json` / `*.json.bz2` reports, e.g. a Slurm study
+which it searches for `*.json` / `*.json.bz2` reports, e.g. a study
 directory; `--csv FILE` writes one row per run. The underlying counters are the
 `topdown_*` and `dispatch_stall_*` statistics of `top.core0.rename`.
 
@@ -232,34 +232,31 @@ directory over `bin/whisper.json`.
 
 Pass the snapshot directory to `--snapshot`.
 
-The performance report (`scripts/parse_scripts/perf_report.py`) treats each
-workload as one snapshot or trace with a SimPoint index and weight, and an
-optional input id; a workload without them is a whole-program run of weight 1
-and the benchmark's only input. SPEC scores also need each input's
-whole-program dynamic instruction count (`--metadata-file`).
+### Performance reports
 
-### Adding a new workload
+`scripts/parse_scripts/perf_report.py` reads a study directory of JSON stat
+dumps (`--report-all FILE json`, optionally bzip2-compressed) and writes a static
+HTML report: SPEC score per GHz, metrics, top-down and per-input tables, with %
+deltas against `--baseline`. `rpmreport` returns the same tables as pandas
+DataFrames.
 
-1. **Lay out** a snapshot workload set as above.
+```
+<study>/
+  <config>/                    one directory per model configuration
+    **/<workload>.json[.bz2]   e.g. mcf_r-ref-inp0-s1-w25000.json
+  report_settings.yml          optional: suite, counts_files
+```
 
-2. **Register** it in `scripts/run_scripts/slurm/benchmarks.yml` under a new name
-   with `type: snapshot`. Point `path` at its `<dir>/` and set `glob` to match
-   the snapshot directories.
+A workload name is `<benchmark>[[-ref|-train|-test]-inp<N>][-s<simpoint>-w<weight>]`,
+with the SimPoint weight scaled by 100000. A workload without a SimPoint suffix
+is a whole-program run of weight 1, and one without an input id is the
+benchmark's only input. SPEC scores also need each input's whole-program dynamic
+instruction count (`--metadata-file`, YAML under `Dynamic-Insts:`).
 
-3. **Run** it in either model by selecting the experiment config
-   (`model: core` vs `model: cluster`) and your benchmark name:
-
-   ```bash
-   # Single-core
-   scripts/run_scripts/slurm/run.py my_study \
-     configs/experiment_configs/core_baseline.yml --benchmarks <name> --partition <partition>
-
-   # Multi-core cluster
-   scripts/run_scripts/slurm/run.py my_study \
-     configs/experiment_configs/cluster_3cores.yml --benchmarks <name> --partition <partition>
-   ```
-
-See `scripts/run_scripts/slurm/README.md` for the full runner reference.
+```bash
+scripts/parse_scripts/perf_report.py my_study --score-ref spec2017 \
+  --metadata-file counts.yml --baseline base
+```
 
 ## CPU Models
 
@@ -421,8 +418,6 @@ tt-rpm/
 │   ├── build_scripts/
 │   ├── run_scripts/
 │   └── parse_scripts/
-│
-├── configs/                        # Experiment configs for the Slurm runner
 │
 └── tests/                          # Bare-metal workloads and regression checks
     ├── Makefile                    # Builds + runs the workloads in the core model

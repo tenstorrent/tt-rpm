@@ -3,14 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 
-"""Write performance_report.html for a study directory written by run.py.
+"""Write performance_report.html for a study directory: <study>/<config>/**/<workload>.json[.bz2].
 
 Scores (SPEC score per GHz), metrics, top-down breakdown, per-input values and host
 runtime of every config in the study, optionally side by side with other studies.
 Defaults for --score-ref and --metadata-file come from the study's report_settings.yml.
 
 Usage:
-    perf_report.py results/experiments/$USER/s/s_<ts> --baseline base
+    perf_report.py my_study --baseline base
     perf_report.py new_study --compare old=path/to/old_study
 """
 from __future__ import annotations

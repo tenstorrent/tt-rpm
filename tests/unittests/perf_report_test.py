@@ -34,7 +34,6 @@ REPO = HERE.parent.parent
 sys.path.insert(0, str(REPO / "scripts" / "parse_scripts"))
 import perf_report  # noqa: E402
 from rpmreport import Report, metrics  # noqa: E402
-from rpmreport.notebook import write_notebook  # noqa: E402
 
 failures = []
 
@@ -138,10 +137,6 @@ with tempfile.TemporaryDirectory() as tmp:
         failures.append("CLI report")
     if perf_report.main(args[:-4] + ["--baseline", "nope"]) == 0:
         failures.append("CLI accepted an unknown baseline")
-
-    nb = json.loads(write_notebook(study, "study", "spec2017", [], REPO).read_text())
-    if nb["nbformat"] != 4 or len(nb["cells"]) < 10:
-        failures.append("notebook")
 
 print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'all checks passed'}")
 sys.exit(1 if failures else 0)

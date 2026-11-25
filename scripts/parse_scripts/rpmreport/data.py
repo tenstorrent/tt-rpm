@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 
-"""Read a run.py study directory: stat dumps, workload names, instruction counts, aggregation."""
+"""Read a study directory: stat dumps, workload names, instruction counts, aggregation."""
 from __future__ import annotations
 
 import bz2
@@ -113,14 +113,6 @@ def read_settings(study_dir: Path) -> dict:
     return record
 
 
-def write_settings(study_dir: Path, name: str, suite: Optional[str], counts_files: list[Path]) -> Path:
-    path = study_dir / SETTINGS_FILE
-    record = {"study": name, "suite": suite or None,
-              "counts_files": [str(p) for p in counts_files]}
-    path.write_text(yaml.safe_dump(record, sort_keys=False))
-    return path
-
-
 # ---------------------------------------------------------------------------
 # stat dumps
 # ---------------------------------------------------------------------------
@@ -215,7 +207,7 @@ def is_dump(path: Path) -> bool:
 
 
 def config_dirs(study_dir: Path, skipped: list[str]) -> dict[str, list[Path]]:
-    """Config name -> its dump files; `<config>/binary/` is the model snapshot, not results."""
+    """Config name -> its dump files; `<config>/binary/` holds model binaries, not results."""
     found: dict[str, list[Path]] = {}
     for d in sorted(study_dir.iterdir()):
         if not d.is_dir() or d.name.startswith(("_", ".")):

@@ -4,7 +4,7 @@
 """Notebook API for RPM study results: tables come back as pandas DataFrames.
 
     import rpmreport
-    r = rpmreport.load("results/experiments/me/s/s_<ts>", baseline="base")
+    r = rpmreport.load("my_study", baseline="base")
     rpmreport.show(r.headline())
     rpmreport.show(r.custom(lambda c: c["top.core0.lsq.num_loads"] / c.cycles, "Loads per cycle"))
 
