@@ -25,13 +25,13 @@ usage() {
     echo ""
     echo "Options:"
     echo "  -m, --model NAME        Model to run: simple, core (required)"
-    echo "  -n, --num-cycles N      Run limit in ticks (~3 ticks/cycle at 3 GHz) (required)"
+    echo "  -n, --num-cycles N      Run limit in ticks (1 tick = 1 ps; ~333 ticks/cycle at 3 GHz) (required)"
     echo "  -e, --elf PATH          ELF binary to execute (required)"
     echo "  -o, --output DIR        Output directory (default: build/<model>/output/<timestamp>)"
     echo "  -h, --help              Show this help"
     echo ""
     echo "The binary reads config.yaml from its working directory (build/<model>/)."
-    echo "build_model.sh copies config.yaml there automatically."
+    echo "build_model.sh links config.yaml there automatically."
     echo ""
     echo "Simulation stdout (retire trace) is saved to <output>/out.txt"
     echo "Simulation stderr (logs/warnings) is saved to <output>/ilog.txt"
@@ -39,7 +39,7 @@ usage() {
     echo "Examples:"
     echo "  $(basename "$0") -m core -n 2000000 -e tests/build/coremark.bare.elf"
     echo "  $(basename "$0") -m simple -n 1000 -e /path/to/program.elf -o results/run1"
-    exit 0
+    exit "${1:-0}"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -49,23 +49,23 @@ while [[ $# -gt 0 ]]; do
         -e|--elf)        ELF="$2"; shift 2 ;;
         -o|--output)     OUTPUT_DIR="$2"; shift 2 ;;
         -h|--help)       usage ;;
-        *)               echo "Unknown option: $1"; usage ;;
+        *)               echo "Unknown option: $1"; usage 1 ;;
     esac
 done
 
 if [ -z "$MODEL" ]; then
     echo "Error: --model is required"
-    usage
+    usage 1
 fi
 
 if [ -z "$NUM_CYCLES" ]; then
     echo "Error: --num-cycles is required"
-    usage
+    usage 1
 fi
 
 if [ -z "$ELF" ]; then
     echo "Error: --elf is required"
-    usage
+    usage 1
 fi
 
 if [ ! -f "$ELF" ]; then
@@ -92,9 +92,9 @@ fi
 
 BUILD_DIR="$(dirname "$BINARY")"
 if [ ! -f "$BUILD_DIR/config.yaml" ]; then
-    echo "Warning: config.yaml not found in $BUILD_DIR"
-    echo "  The model will use scalar defaults (retire_width=1, fetch_width=1)."
-    echo "  Rebuild with build_model.sh to copy config.yaml automatically."
+    echo "Error: $BUILD_DIR/config.yaml is missing or a dangling link"
+    echo "  Rebuild with build_model.sh to link config.yaml from the model source."
+    exit 1
 fi
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -111,13 +111,21 @@ echo "  Binary:     $BIN_REL"
 echo "  Ticks:      $NUM_CYCLES"
 echo "  ELF:        $ELF"
 echo "  Output:     $OUTPUT_DIR"
-if [ -f "$BUILD_DIR/config.yaml" ]; then
-    echo "  Config:     $BUILD_DIR/config.yaml"
-fi
+echo "  Config:     $BUILD_DIR/config.yaml"
 echo ""
 
+# core reads config.yaml only via -c, which its legacy positional form can't take.
+SIM_ARGS=("$NUM_CYCLES" "$ELF")
+if [ "$MODEL" = core ]; then
+    case "$ELF" in
+        *-trace*|*-snap*|*.csv|*.csv.zst) INPUT_FLAG=--snapshot ;;
+        *)                                INPUT_FLAG=--target-elf ;;
+    esac
+    SIM_ARGS=(-c config.yaml -r "$NUM_CYCLES" "$INPUT_FLAG" "$ELF")
+fi
+
 # Capture the exit code without tripping `set -e`, so the summary always prints.
-if (cd "$BUILD_DIR" && "$BINARY" "$NUM_CYCLES" "$ELF") \
+if (cd "$BUILD_DIR" && "$BINARY" "${SIM_ARGS[@]}") \
         > "$OUTPUT_DIR/out.txt" 2> "$OUTPUT_DIR/ilog.txt"; then
     EXIT_CODE=0
 else

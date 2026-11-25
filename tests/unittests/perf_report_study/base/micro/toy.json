@@ -1,0 +1,46 @@
+{
+ "Statistics": {
+  "@ on _SPARTA_global_node_": {
+   "scheduler": {
+    "host_machine_wall_runtime_seconds": {
+     "val": 1,
+     "desc": "",
+     "vis": 0
+    }
+   },
+   "clocks": {
+    "Root": {
+     "cycles": {
+      "val": 500000,
+      "desc": "",
+      "vis": 0
+     },
+     "cpu_clock_0": {
+      "cycles": {
+       "val": 1000,
+       "desc": "",
+       "vis": 0
+      }
+     }
+    }
+   },
+   "top": {
+    "core0": {
+     "writeback": {
+      "ordered_keys": [
+       "num_retired"
+      ],
+      "num_retired": {
+       "val": 2000,
+       "desc": "",
+       "vis": 0
+      }
+     }
+    }
+   }
+  }
+ },
+ "vis": {},
+ "siminfo": {},
+ "report_metadata": {}
+}

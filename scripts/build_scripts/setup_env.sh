@@ -76,6 +76,7 @@ check_pkg yaml-cpp "yaml-cpp/yaml.h"
 check_pkg sqlite3 "sqlite3.h"
 check_pkg zlib "zlib.h"
 check_pkg RapidJSON "rapidjson/rapidjson.h"
+check_pkg hdf5 "hdf5.h"
 echo ""
 
 echo "Libraries (header probe):"

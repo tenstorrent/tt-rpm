@@ -24,7 +24,7 @@ from pathlib import Path
 
 # Allow "from parse_stats import extract_stats" regardless of invocation cwd.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from parse_stats import extract_stats  # noqa: E402
+from parse_stats import NoStatsError, extract_stats  # noqa: E402
 
 
 SUMMARY_COLUMNS = [
@@ -104,20 +104,33 @@ def main() -> int:
 
     grouped: dict[tuple[str, str], list[dict]] = {}
     all_rows: list[dict] = []
+    no_stats = 0
 
     for exp_name, bench_name, log_path in discover_logs(study_dir):
-        stats = parse_one_log(log_path)
+        try:
+            stats = parse_one_log(log_path)
+        except (EOFError, OSError) as e:
+            # A task killed at its time limit (or still running) leaves a truncated log.
+            print(f"warning: skipping {log_path.relative_to(study_dir)}: {e}", file=sys.stderr)
+            continue
+        except NoStatsError as e:
+            print(f"warning: {log_path.relative_to(study_dir)}: {e}", file=sys.stderr)
+            no_stats += 1
+            stats = None
         row = {
             "experiment": exp_name,
             "benchmark": bench_name,
             "workload": workload_name_from_log(log_path),
-            "total_cycles": stats["total_cycles"],
-            "total_instructions": stats["total_instructions"],
-            "ipc": f"{stats['ipc']:.6f}",
-            "retire_samples": stats["retire_samples"],
-            "setup_time_s": f"{stats['setup_time_s']:.2f}",
             "log_file": str(log_path.relative_to(study_dir)),
         }
+        if stats:  # else the stat cells stay empty, so the run reads as missing, not as zeros
+            row.update({
+                "total_cycles": stats["total_cycles"],
+                "total_instructions": stats["total_instructions"],
+                "ipc": f"{stats['ipc']:.6f}",
+                "retire_samples": stats["retire_samples"],
+                "setup_time_s": f"{stats['setup_time_s']:.2f}",
+            })
         grouped.setdefault((exp_name, bench_name), []).append(row)
         all_rows.append(row)
 
@@ -130,7 +143,7 @@ def main() -> int:
 
     summary = study_dir / "summary.csv"
     write_bench_csv(all_rows, summary)
-    print(f"parsed {len(all_rows)} log(s); summary at {summary}")
+    print(f"parsed {len(all_rows)} log(s), {no_stats} without stats; summary at {summary}")
     return 0
 
 

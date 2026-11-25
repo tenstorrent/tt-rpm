@@ -6,11 +6,25 @@
 #include <cstdint>
 #include <list>
 #include <unordered_map>
+#include <vector>
 
 #include "Common/PipelinePacket.hpp"
 #include "MemoryHierarchy/Cache.hpp"
 
 namespace midcore {
+
+// Bytes [addr, addr + size) touched by one element of a memory access.
+struct MemRange {
+    cpu::address_t addr{0};
+    uint32_t size{0};
+};
+
+inline bool overlaps(const std::vector<MemRange>& a, const std::vector<MemRange>& b) {
+    for (const auto& x : a)
+        for (const auto& y : b)
+            if (x.addr < y.addr + y.size && y.addr < x.addr + x.size) return true;
+    return false;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // StoreQueue — non-Sparta helper class for the LSU.
@@ -18,8 +32,7 @@ namespace midcore {
 // Holds in-flight store instructions. Stores are committed in-order when the
 // ROB retires them, then drained to the D-cache store buffer.
 //
-// Supports store-to-load forwarding: loads can query the SQ for recent stores
-// that fully cover the load's address range.
+// Fences and atomics also take an SQ entry, so they are ordered with the stores.
 // ─────────────────────────────────────────────────────────────────────────────
 
 class StoreQueue {
@@ -28,9 +41,20 @@ class StoreQueue {
         core::IssuePacket ipkt;
         cpu::address_t address{0};
         uint8_t access_size{4};
+        std::vector<cpu::address_t> lines;  // cache lines touched, requested in order
+        std::vector<MemRange> ranges{};     // bytes written; empty for a fence or LR
+        uint32_t next_line{0};
         bool address_known{false};
         bool committed{false};      // ROB has retired this store
-        bool sent_to_cache{false};  // Drained to D-cache store buffer
+        bool sent_to_cache{false};  // Drained to D-cache store buffer (fence/atomic: done)
+        uint64_t data_ready_cycle{0};
+        uint64_t pred_seq{UINT64_MAX};  // store-set predecessor that must resolve first
+        bool is_fence{false};
+        bool is_atomic{false};
+        bool acquire{false};            // atomic with aq set: orders younger loads
+        uint32_t responses_pending{0};  // atomic D-cache access in flight
+        uint64_t req_id{0};
+        bool request_sent{false};
     };
 
     explicit StoreQueue(uint32_t capacity)
@@ -42,9 +66,10 @@ class StoreQueue {
     uint32_t capacity() const { return mCapacity; }
 
     // Enqueue a new store
-    void enqueue(const core::IssuePacket& ipkt, cpu::address_t addr, uint8_t size) {
-        mEntries.emplace_back(Entry{.ipkt = ipkt, .address = addr, .access_size = size, .address_known = true});
+    Entry& enqueue(const core::IssuePacket& ipkt, cpu::address_t addr, uint8_t size, std::vector<cpu::address_t> lines) {
+        mEntries.emplace_back(Entry{.ipkt = ipkt, .address = addr, .access_size = size, .lines = std::move(lines), .address_known = true});
         mTagIndex[ipkt.pkt.tag] = std::prev(mEntries.end());
+        return mEntries.back();
     }
 
     // Find entry by tag (O(1) via tag index)
@@ -60,24 +85,14 @@ class StoreQueue {
         return nullptr;
     }
 
-    // ── Store-to-Load Forwarding ─────────────────────────────────────────────
-    //
-    // Search backwards (most recent store first) for a store older than the load
-    // (lower tag) that fully covers the load address range [addr, addr + size).
-    //
-    // Returns pointer to the forwarding store entry, or nullptr if no match.
-    const Entry* findForwardingOlderThan(cpu::address_t addr, uint8_t size, uint64_t load_tag) const {
-        for (auto it = mEntries.rbegin(); it != mEntries.rend(); ++it) {
-            // Only consider stores older than the load (lower tag = older)
-            if (it->ipkt.pkt.tag >= load_tag) continue;
-            if (!it->address_known) continue;
-            cpu::address_t st_end = it->address + it->access_size;
-            cpu::address_t ld_end = addr + size;
-            if (it->address <= addr && st_end >= ld_end) {
-                return &(*it);
-            }
+    // Youngest store older than load_tag that writes any of the given bytes, or nullptr.
+    const Entry* youngestOverlappingOlderThan(const std::vector<MemRange>& ranges, uint64_t load_tag) const {
+        const Entry* best = nullptr;
+        for (const auto& e : mEntries) {
+            if (e.ipkt.pkt.tag >= load_tag || (best && e.ipkt.pkt.tag < best->ipkt.pkt.tag)) continue;
+            if (overlaps(e.ranges, ranges)) best = &e;
         }
-        return nullptr;
+        return best;
     }
 
     // ── Commit / Drain ───────────────────────────────────────────────────────

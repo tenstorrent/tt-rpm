@@ -29,7 +29,7 @@ usage() {
     echo "  -c, --clean           Clean build (remove existing build artifacts first)"
     echo "  -t, --type TYPE       CMake build type for Sparta (default: Release)"
     echo "  -h, --help            Show this help"
-    exit 0
+    exit "${1:-0}"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -38,7 +38,7 @@ while [[ $# -gt 0 ]]; do
         -c|--clean) CLEAN=1; shift ;;
         -t|--type)  BUILD_TYPE="$2"; shift 2 ;;
         -h|--help)  usage ;;
-        *) echo "Unknown option: $1"; usage ;;
+        *) echo "Unknown option: $1"; usage 1 ;;
     esac
 done
 
@@ -88,7 +88,11 @@ if [ ! -f "$WHISPER_ROOT/Makefile" ] && [ ! -f "$WHISPER_ROOT/GNUmakefile" ]; th
     echo "  Run: git submodule update --init --recursive"
     exit 1
 fi
-make -C "$WHISPER_ROOT" -j "$JOBS"
+# Only the libraries: the whisper executable needs a newer compiler than RPM does.
+make -C "$WHISPER_ROOT" -j "$JOBS" build-Linux/librvcore.a
+make -C "$WHISPER_ROOT/third_party/softfloat/build/RISCV-GCC" -j "$JOBS"
+make -C "$WHISPER_ROOT/pci" -j "$JOBS" libpci.a
+make -C "$WHISPER_ROOT/virtual_memory" -j "$JOBS"
 echo "  Whisper build complete."
 echo ""
 

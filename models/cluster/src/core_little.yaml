@@ -1,0 +1,93 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
+
+# "little" CPU type for heterogeneous cluster studies: narrow pipeline, small
+# structures and caches. Referenced by cpu_types.little.core_config. The
+# `top.coreN` root is stripped by ClusterSim; every param below applies to each
+# little core.
+# Widths, ROB, registers, branch checkpoints, LSQ and L1 sizes follow BOOM MediumBoomConfig
+# (riscv-boom config-mixins.scala); issue ports, buffers, predictor and latencies do not.
+
+top.core0:
+  params:
+    ooo_enabled: true
+    wrong_path_enabled: true
+    bypass_queues: false
+    visualizer_enabled: false
+  fetch:
+    params:
+      fetch_width: 8
+      fetch_buffer_capacity: 32
+  icache:
+    params:
+      cache_mode: structural
+      prefetcher_type: next_line       # as the single-core config.yaml
+      prefetch_degree: 2
+      hit_latency: 2
+      miss_latency: 10
+      mshr_capacity: 2
+      cache_size_kb: 16
+      cache_line_size: 64
+      cache_associativity: 4
+      replacement_policy: lru
+  fetch_queue:
+    params:
+      capacity: 16
+  decode:
+    params:
+      decode_width: 2
+  decode_queue:
+    params:
+      capacity: 16
+  branch_predictor:
+    params:
+      predictor_type: tage_sc_l_8kb  # CBP-5's 8 KB budget for the small core
+  rename:
+    params:
+      dispatch_width: 2
+      num_phys_regs: 80
+      max_branch_checkpoints: 12
+  issue:
+    params:
+      mode: unified
+      issue_queue_capacity: 20
+      issue_width: 5
+      num_phys_regs: 80
+      issue_ports: [ALU+Branch+Fence, ALU+Branch+Mul+Div, Load, Load+Store, FpOp+VecOp]
+  execute:
+    params:
+      granularity: unified
+      write_port_mode: unified
+      write_port_count: 5
+      unified_max_in_flight: 64
+  lsq:
+    params:
+      load_queue_capacity: 16
+      store_queue_capacity: 16
+  dcache:
+    params:
+      cache_mode: structural
+      prefetcher_type: ip_stride       # as the single-core config.yaml
+      prefetch_degree: 2
+      prefetch_distance: 4
+      prefetch_mshr_reserve: 1         # of 2 MSHRs; the default 2 would leave none
+      hit_latency: 3
+      miss_latency: 10
+      mshr_capacity: 2
+      cache_size_kb: 16
+      cache_line_size: 64
+      cache_associativity: 4
+      replacement_policy: lru
+      store_buffer_capacity: 8
+      write_policy: write_back
+  writeback:
+    params:
+      retire_width: 2
+      rob_capacity: 64
+  l2cache:
+    params:
+      enabled: false                   # little core: no private L2 (L1 -> shared cluster cache)
+      cache_size_kb: 16
+      cache_line_size: 64
+      cache_associativity: 8
+      queue_capacity: 32

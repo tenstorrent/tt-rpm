@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
+
+# Cluster config for the DMA doorbell smoke test: one OOO core + one DmaEngine
+# attached as a fabric peer (loose coupling: MMIO doorbell + descriptor ring).
+# Run from this directory: ../../build/top/cluster/cluster --cluster-config config.yaml
+
+# ---- Cluster (generic) ----
+cache_hit_latency: 12               # shared cluster cache hit latency (cycles)
+cache_miss_latency: 100             # shared cluster cache miss latency to backing memory (cycles)
+cluster_cache_size_kb: 2048         # shared cluster cache capacity (2 MB LLC)
+cluster_cache_associativity: 8      # shared cluster cache ways
+line_size: 64                       # cache line size (bytes)
+coherence_enabled: true             # MSI directory: the DMA's dst WriteUniques snoop-invalidate the core
+
+# ---- Accelerators (optional fabric peers) ----
+# The BAR range must match the dcache uncacheable_base/uncacheable_size in
+# core_config.yaml so doorbell stores actually reach the fabric. The doorbell
+# register (u64 ring tail) lives at bar_base+0; descriptors are 32B
+# {opcode, src, dst, len} entries in guest memory at ring_base.
+accelerators:
+  - type: dma
+    bar_base: 0xf0000000
+    bar_size: 0x1000
+    ring_base: 0x81000000
+    ring_slots: 16
+    max_outstanding: 8
+
+# ---- CPU types + core assignment (REQUIRED) ----
+cpu_types:
+  core:
+    core_config: core_config.yaml   # this core's CPU config
+cores:
+  - { type: core, hartids: "0" }    # single core: the microbench rings the doorbell once
+
+# Workload:
+program: "dma_doorbell.elf"   # built by this directory's Makefile
+snapshot: ""
+instruction_limit: 0          # run until the program exits via tohost
+
+# Set true to stream per-unit activity (ILOG) to stdout.
+verbose: false

@@ -1,0 +1,92 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
+
+# CPU config for the out-of-order core model dropped into the cluster.
+#
+# This is the core model's OWN config file (cache sizes, ROB, issue widths, ...).
+# ClusterSim loads it via the `core_config:` knob in config.yaml, strips the
+# `top.core0` root, and applies every param to each cluster core's subtree. The
+# cluster only layers topology decisions (private-L2 on/off, line size) on top.
+#
+# Caches here are intentionally SMALL so each core's working set spills out of the
+# private hierarchy and generates traffic to the shared cluster cache. Edit these
+# to study different cache geometries -- nothing is hard-coded in the model.
+# Widths, ROB, registers, branch checkpoints, LSQ and L1 sizes follow BOOM MegaBoomConfig
+# (riscv-boom config-mixins.scala); issue ports, buffers, L2 and latencies do not.
+
+top.core0:
+  params:
+    ooo_enabled: true
+    wrong_path_enabled: true
+    bypass_queues: false
+    visualizer_enabled: false
+  fetch:
+    params:
+      fetch_width: 16
+      fetch_buffer_capacity: 64
+  icache:
+    params:
+      cache_mode: structural           # probabilistic + hit_rate=1.0 never misses
+      prefetcher_type: next_line       # as the single-core config.yaml
+      prefetch_degree: 2
+      hit_latency: 2
+      miss_latency: 10
+      mshr_capacity: 4
+      cache_size_kb: 32                # private L1 (per core)
+      cache_line_size: 64
+      cache_associativity: 8
+      replacement_policy: lru
+  fetch_queue:
+    params:
+      capacity: 32
+  decode_queue:
+    params:
+      capacity: 32
+  rename:
+    params:
+      dispatch_width: 4
+      num_phys_regs: 128
+      max_branch_checkpoints: 20
+  issue:
+    params:
+      mode: unified
+      issue_queue_capacity: 36
+      issue_width: 9
+      num_phys_regs: 128
+      issue_ports: [ALU+Branch+Fence, ALU+Branch, ALU+Mul+Div, ALU, Load, Load, Store, FpOp+VecOp, FpOp+VecOp]
+  execute:
+    params:
+      granularity: unified
+      write_port_mode: unified
+      write_port_count: 8
+      unified_max_in_flight: 64
+  lsq:
+    params:
+      load_queue_capacity: 32
+      store_queue_capacity: 32
+  dcache:
+    params:
+      cache_mode: structural
+      prefetcher_type: ip_stride       # as the single-core config.yaml
+      prefetch_degree: 2
+      prefetch_distance: 4
+      hit_latency: 3
+      miss_latency: 10
+      mshr_capacity: 8
+      cache_size_kb: 32                # private L1 (per core)
+      cache_line_size: 64
+      cache_associativity: 8
+      replacement_policy: lru
+      store_buffer_capacity: 8
+      write_policy: write_back
+  writeback:
+    params:
+      retire_width: 4
+      rob_capacity: 128
+  l2cache:
+    params:
+      enabled: false                   # this core's private L2 (topology lives here, per core)
+      cache_size_kb: 16                # small private L2: force egress to cluster cache
+      cache_line_size: 64
+      cache_associativity: 8
+      queue_capacity: 64               # headroom for the heavy-miss burst to the L2

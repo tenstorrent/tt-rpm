@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
+
+# 3-core heterogeneous cluster, sized to match any 3-hart snapshot (registers0..2).
+#
+# In snapshot/ELF mode the harts are positional: hartids must be a contiguous
+# 0..N-1 and the core count must equal the snapshot's hart count. Here: 1 big on
+# hart 0, 2 little on harts 1-2 -> 3 cores for a 3-register snapshot.
+#
+# Run:
+#   build/top/cluster/cluster \
+#     --cluster-config models/cluster/src/config_heterogeneous_3core.yaml \
+#     --snapshot <3-hart snapshot dir> -i 50000
+
+# ---- Cluster (shared by all cores) ----
+cache_hit_latency: 12
+cache_miss_latency: 100
+cluster_cache_size_kb: 2048
+cluster_cache_associativity: 8
+line_size: 64
+coherence_enabled: true
+coherence_latency: 0
+
+# ---- CPU type library (core_config paths are relative to this file) ----
+cpu_types:
+  big:
+    core_config: core_big.yaml
+    cpu_freq: 3.0
+  little:
+    core_config: core_little.yaml
+    cpu_freq: 2.0
+
+# ---- Core assignment (total = 3 cores, contiguous harts 0-2) ----
+cores:
+  - { type: big,    hartids: [0] }
+  - { type: little, hartids: "1-2" }
+
+# ---- Clock domains ----
+cache_freq: 2.0
+
+# ---- Workload (snapshot passed on the command line via --snapshot) ----
+program: ""
+snapshot: ""
+
+instruction_limit: 0
+
+verbose: false

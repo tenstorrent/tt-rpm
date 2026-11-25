@@ -3,12 +3,14 @@
 
 #include "Frontend/FetchStructures/FetchStructures.hpp"
 
+#include <algorithm>
+#include <bit>
 #include <iostream>
 
-#include "Common/SpeculationConfig.hpp"
 #include "Common/SpeculationUtils.hpp"
 #include "Frontend/FrontendMemoryStructures/FrontendMemoryStructures.hpp"
 #include "Logging.hpp"
+#include "Mmu/Mmu.hpp"
 #include "models/cpu/common/ExecutionDriver.hpp"
 #include "models/cpu/common/whisper_include_fix.hpp"
 
@@ -115,6 +117,30 @@ uint64_t decodeBranchTarget(uint64_t pc, uint32_t inst) {
     return 0;
 }
 
+// Classifies a branch from its encoding. RAS actions follow the RISC-V unprivileged spec's JAL/JALR
+// hint table: rd a link register (x1 or x5) pushes, rs1 one pops, and both, if different, pop then push.
+predictors::BranchType branchType(uint32_t inst) {
+    using predictors::BranchType;
+    auto link = [](uint32_t r) { return r == 1 || r == 5; };
+    uint32_t rd = 0;
+    uint32_t rs1 = 0;
+    if ((inst & 3) != 3) {
+        if ((inst & 0xE003) == 0xA001) return BranchType::DirectJump;   // C.J
+        if ((inst & 0xE003) == 0x2001) return BranchType::Call;         // C.JAL (RV32)
+        if ((inst & 0xE07F) != 0x8002) return BranchType::Conditional;  // C.BEQZ, C.BNEZ
+        rd = (inst >> 12) & 1;                                          // C.JR writes x0, C.JALR x1
+        rs1 = (inst >> 7) & 0x1F;
+    } else {
+        if ((inst & 0x7F) == 0x63) return BranchType::Conditional;
+        rd = (inst >> 7) & 0x1F;
+        if ((inst & 0x7F) == 0x6F) return link(rd) ? BranchType::Call : BranchType::DirectJump;
+        rs1 = (inst >> 15) & 0x1F;
+    }
+    if (link(rd) && link(rs1) && rd != rs1) return BranchType::CoroutineSwap;
+    if (link(rd)) return BranchType::IndirectCall;
+    return link(rs1) ? BranchType::Return : BranchType::IndirectJump;
+}
+
 }  // anonymous namespace
 
 FetchStructures::FetchStructures(sparta::TreeNode* node, const FetchStructuresParams* params)
@@ -122,14 +148,25 @@ FetchStructures::FetchStructures(sparta::TreeNode* node, const FetchStructuresPa
       mPc(params->initial_pc),
       mFetchWidth(params->fetch_width),
       mFetchBufferCapacity(params->fetch_buffer_capacity),
+      mMaxBranchesPerFetch(params->max_branches_per_fetch),
       mNumFetched(&unit_stat_set_, "num_fetched", "Total instructions fetched", sparta::Counter::COUNT_NORMAL),
-      mNumBufferFullStallCycles(&unit_stat_set_, "num_buffer_full_stall_cycles", "Cycles stalled due to full fetch buffer", sparta::Counter::COUNT_NORMAL),
+      mNumBufferFullStallCycles(&unit_stat_set_, "num_buffer_full_stall_cycles",
+                                "Cycles stalled because fetched packets filled the FetchQueue (with bypass_queues, Decode's buffer)",
+                                sparta::Counter::COUNT_NORMAL),
       mNumRedirects(&unit_stat_set_, "num_redirects", "Pipeline redirects received", sparta::Counter::COUNT_NORMAL),
-      mNumMispredPenaltyStalls(&unit_stat_set_, "num_mispred_penalty_stalls", "Cycles stalled due to misprediction penalty", sparta::Counter::COUNT_NORMAL) {
+      mNumMispredPenaltyStalls(&unit_stat_set_, "num_mispred_penalty_stalls",
+                               "Cycles fetch waited for a mispredicted branch to resolve, plus misprediction_penalty_cycles (wrong_path_enabled false)",
+                               sparta::Counter::COUNT_NORMAL),
+      mNumBranchLimitEnds(&unit_stat_set_, "num_branch_limit_ends", "Fetch groups ended by max_branches_per_fetch alone", sparta::Counter::COUNT_NORMAL),
+      mNumTakenBubbleCycles(&unit_stat_set_, "num_taken_bubble_cycles", "Cycles stalled before a predicted-taken branch steered fetch",
+                            sparta::Counter::COUNT_NORMAL) {
+    sparta_assert(mMaxBranchesPerFetch > 0, params->max_branches_per_fetch.getLocation() << " must be at least 1");
+    sparta_assert(std::has_single_bit(mFetchWidth), params->fetch_width.getLocation() << " must be a power of two");
     response_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(FetchStructures, receiveResponse, core::FetchResponse));
     bp_redirect_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(FetchStructures, receiveBpRedirect_, core::PredictedRedirect));
     mispred_redirect_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(FetchStructures, receiveMispredRedirect_, core::BranchRedirect));
     branch_resolved_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(FetchStructures, receiveBranchResolved_, core::BranchResolved));
+    taken_bubble_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(FetchStructures, receiveTakenBubble_, uint32_t));
 }
 
 void FetchStructures::tick() {
@@ -140,11 +177,24 @@ void FetchStructures::tick() {
         return;
     }
 
-    // Stall fetch for misprediction penalty (used when wrong_path_enabled=false)
+    // A misprediction redirect arrives in the cycle the branch resolves and takes effect the next.
+    if (mMispredRedirectCycle == cycle) return;
+
+    // Wrong path off: fetch waits for a mispredicted branch to resolve, then the extra penalty.
+    if (mAwaitingResolve) {
+        ++mNumMispredPenaltyStalls;
+        return;
+    }
     if (mMispredStallCycles > 0) {
         --mMispredStallCycles;
         ++mNumMispredPenaltyStalls;
         ILOG("[fetch] cycle " << cycle << " STALLED: misprediction penalty (" << mMispredStallCycles << " cycles remaining)");
+        return;
+    }
+
+    if (mTakenBubbleCycles > 0) {
+        --mTakenBubbleCycles;
+        ++mNumTakenBubbleCycles;
         return;
     }
 
@@ -171,13 +221,33 @@ void FetchStructures::tick() {
     }
     mFirstFetch = false;
 
-    // Stall fetch if I-Cache MSHRs are saturated
-    if (mCache && !mCache->canAcceptRequest(base_pc)) {
-        ILOG("[fetch] cycle " << getClock()->currentCycle() << " STALLED: I-Cache MSHRs full");
+    if (mCache && mCache->downstreamFull()) {
+        ++mNumBufferFullStallCycles;
+        return;
+    }
+
+    // Stall fetch if I-Cache MSHRs are saturated. The cache is physically addressed; fetchPa uses the
+    // hart's current mode, which may not be this fetch's, so it serves only this check, not the request.
+    if (mCache) {
+        if (base_pc != mPrecheckVa) {
+            mPrecheckVa = base_pc;
+            mPrecheckPa = mDriver->fetchPa(base_pc);
+        }
+        if (!mCache->canAcceptRequest(mPrecheckPa)) {
+            ILOG("[fetch] cycle " << getClock()->currentCycle() << " STALLED: I-Cache MSHRs full");
+            return;
+        }
+    }
+
+    if (mMmu && !mMmu->fetchReady(base_pc)) {
+        ILOG("[fetch] cycle " << cycle << " STALLED: ITLB miss");
         return;
     }
 
     std::vector<core::PipelinePacket> packets;
+    uint32_t num_branches = 0;
+    // A group ends at the next fetch_width-aligned boundary, so it never crosses an I-cache line (BOOM nextFetch).
+    const uint64_t fetch_end = (base_pc & ~static_cast<uint64_t>(mFetchWidth - 1)) + mFetchWidth;
 
     while (!mDriver->isFinished()) {
         // Determine fetch PC - use speculative PC when on predicted path
@@ -204,7 +274,9 @@ void FetchStructures::tick() {
         pkt.wrong_path_depth = mCurrentWrongPathDepth;  // Track speculation depth
 
         // Send branch prediction request IN PARALLEL with ICache request
-        if (pkt.inst_class == cpu::InstClass::Branch || pkt.inst_class == cpu::InstClass::Jump) {
+        const bool is_branch = (pkt.inst_class == cpu::InstClass::Branch || pkt.inst_class == cpu::InstClass::Jump);
+        if (is_branch) {
+            ++num_branches;
             const auto& rec = pkt.inst->getTraceRecord();
             core::BranchPrediction pred_req;
             pred_req.tag = pkt.tag;
@@ -229,6 +301,7 @@ void FetchStructures::tick() {
 
             // Initial prediction based on actual outcome from Whisper's trace
             pred_req.predicted_taken = (rec.takenBranchTarget != 0);
+            pred_req.type = branchType(rec.inst);
 
             predict_request_out.send(pred_req, 0);
 
@@ -246,19 +319,26 @@ void FetchStructures::tick() {
 
         // Update speculative PC for next fetch (sequential advance)
         // BP will send a redirect if a branch is predicted taken
+        const uint64_t taken_target = pkt.inst->getTraceRecord().takenBranchTarget;
         if (mOnSpeculativePath) {
-            mSpeculativePc = fetch_pc + pkt.size;
+            mSpeculativePc = (mFollowWrongPathBranches && taken_target != 0) ? taken_target : fetch_pc + pkt.size;
         }
 
+        const bool taken = (taken_target != 0) && (!mOnSpeculativePath || mFollowWrongPathBranches);
         packets.push_back(std::move(pkt));
 
         if (is_serializing || (!mOnSpeculativePath && !mDriver->isNextPcAvailable())) {
             break;
         }
 
-        // Check if we should continue fetching
+        // A fetch block ends at its first taken branch.
         uint64_t next_pc = mOnSpeculativePath ? mSpeculativePc : mDriver->getNextPc();
-        if (next_pc <= fetch_pc || next_pc >= base_pc + mFetchWidth) break;
+        const bool block_ends = taken || next_pc <= fetch_pc || next_pc >= fetch_end;
+        if (is_branch && num_branches == mMaxBranchesPerFetch) {
+            if (!block_ends) ++mNumBranchLimitEnds;
+            break;
+        }
+        if (block_ends) break;
     }
 
     if (!packets.empty()) {
@@ -277,41 +357,54 @@ void FetchStructures::sendRequest(uint64_t base_pc, std::vector<core::PipelinePa
     ILOG("[fetch] cycle " << cycle << " SENDING " << packets.size() << " packets to ICache");
 
     core::FetchRequest req;
-    req.base_pc = base_pc;
+    // The I-cache is physically addressed; base_pc is the first packet's PC.
+    const uint64_t pa = packets.empty() ? 0 : packets.front().inst->getTraceRecord().physPc;
+    req.base_pc = pa ? pa : base_pc;
     req.size_bytes = mFetchWidth;
     req.packets = std::move(packets);
     request_out.send(req, 1);
 }
 
+// A request can hold the redirecting branch and older instructions as well as squashed ones; the
+// survivors are re-sent. Redirects land before Fetch ticks, so a request still on the port is due
+// this cycle and the re-send must arrive before the I-cache ticks and Fetch checks its MSHRs.
+void FetchStructures::cancelInFlight_(uint64_t branch_tag, uint8_t branch_depth, core::FlushSource source) {
+    const uint64_t cycle = getClock()->currentCycle();
+    std::vector<core::FetchRequest> survivors;
+    const uint32_t cancelled = request_out.cancelIf([&](const core::FetchRequest& req) -> bool {
+        core::FetchRequest kept = req;
+        kept.packets.clear();
+        for (const auto& pkt : req.packets) {
+            if (core::shouldSquash(pkt.tag, pkt.wrong_path_depth, branch_tag, branch_depth, source)) {
+                ILOG("[fetch] cycle " << cycle << " CANCELLING in-flight tag=" << pkt.tag << " depth=" << (int)pkt.wrong_path_depth);
+                if (mVis) mVis->onSquash(pkt.fetch_seq, cycle);
+            } else {
+                kept.packets.push_back(pkt);
+            }
+        }
+        if (kept.packets.size() == req.packets.size()) return false;
+        if (!kept.packets.empty()) survivors.push_back(std::move(kept));
+        return true;
+    });
+    for (auto& req : survivors) request_out.send(req, 0);
+    if (cancelled > 0) ILOG("[fetch] cycle " << cycle << " cancelled " << cancelled << " in-flight requests, re-sent " << survivors.size());
+}
+
 void FetchStructures::receiveBpRedirect_(const core::PredictedRedirect& redirect) {
     uint64_t cycle = getClock()->currentCycle();
 
-    // If speculation is disabled, ignore all BP redirects - they would corrupt Whisper state
-    if (!core::getSpeculationConfig().enabled) {
-        ILOG("[fetch] cycle " << cycle << " IGNORING BP redirect: speculation disabled");
-        return;
-    }
-
-    // Ignore stale BP redirects from squashed branches. After a mispred recovery,
-    // squash_threshold_fetch_seq holds the fetch_seq counter at that recovery — anything
-    // older is from wrong-path instructions.
-    if (mStaleFilter.squash_threshold_fetch_seq > 0 && redirect.branch_fetch_seq < mStaleFilter.squash_threshold_fetch_seq) {
-        ILOG("[fetch] cycle " << cycle << " IGNORING stale BP redirect: branch_fetch_seq=" << redirect.branch_fetch_seq
-                              << " < squash_threshold=" << mStaleFilter.squash_threshold_fetch_seq);
-        return;
-    }
-
-    // Also filter by depth as a secondary check
-    if (redirect.wrong_path_depth > mCurrentWrongPathDepth) {
-        ILOG("[fetch] cycle " << cycle << " IGNORING stale BP redirect: branch_tag=" << redirect.branch_tag
-                              << " redirect_depth=" << (int)redirect.wrong_path_depth << " > current_depth=" << (int)mCurrentWrongPathDepth);
+    // Wrong path off: drop what was fetched past the branch and wait for it to resolve.
+    if (!mSpecCfg->enabled) {
+        if (mDriver) mDriver->flushInstruction(redirect.branch_tag + 1);
+        cancelInFlight_(redirect.branch_tag, mCurrentWrongPathDepth, core::FlushSource::BranchPredictor);
+        mAwaitingResolve = true;
+        ILOG("[fetch] cycle " << cycle << " HOLD until branch_tag=" << redirect.branch_tag << " resolves");
         return;
     }
 
     // Enforce max_depth - don't speculate beyond max_depth
-    const auto& spec_cfg = core::getSpeculationConfig();
-    if (mCurrentWrongPathDepth >= spec_cfg.max_depth) {
-        ILOG("[fetch] cycle " << cycle << " BLOCKING BP redirect: max_depth=" << (int)spec_cfg.max_depth
+    if (mCurrentWrongPathDepth >= mSpecCfg->max_depth) {
+        ILOG("[fetch] cycle " << cycle << " BLOCKING BP redirect: max_depth=" << (int)mSpecCfg->max_depth
                               << " reached, current_depth=" << (int)mCurrentWrongPathDepth);
         return;  // Don't speculate further, stay on current path
     }
@@ -330,21 +423,7 @@ void FetchStructures::receiveBpRedirect_(const core::PredictedRedirect& redirect
 
     // Cancel any in-flight packets to ICache that should be squashed
     // (packets younger than the branch at the same or deeper depth)
-    uint32_t cancelled = request_out.cancelIf([&](const core::FetchRequest& req) -> bool {
-        bool should_cancel = false;
-        for (const auto& pkt : req.packets) {
-            if (core::shouldSquash(pkt.tag, pkt.wrong_path_depth, redirect.branch_tag, branch_depth, core::FlushSource::BranchPredictor)) {
-                ILOG("[fetch] cycle " << cycle << " CANCELLING in-flight tag=" << pkt.tag << " depth=" << (int)pkt.wrong_path_depth);
-                if (mVis) mVis->onSquash(pkt.fetch_seq, cycle);
-                should_cancel = true;  // Mark for cancellation but continue to call onSquash for all packets
-            }
-        }
-        return should_cancel;
-    });
-
-    if (cancelled > 0) {
-        ILOG("[fetch] cycle " << cycle << " cancelled " << cancelled << " in-flight requests");
-    }
+    cancelInFlight_(redirect.branch_tag, branch_depth, core::FlushSource::BranchPredictor);
 
     // Increment speculation depth - we're now fetching on a predicted path
     ++mCurrentWrongPathDepth;
@@ -363,48 +442,18 @@ void FetchStructures::receiveBpRedirect_(const core::PredictedRedirect& redirect
 void FetchStructures::receiveMispredRedirect_(const core::BranchRedirect& redirect) {
     uint64_t cycle = getClock()->currentCycle();
 
-    // If speculation is disabled, apply static misprediction penalty instead of full wrong-path modeling
-    if (!core::getSpeculationConfig().enabled) {
-        if (mMispredictionPenalty > 0) {
-            mMispredStallCycles = mMispredictionPenalty;
-            ++mNumRedirects;
-            ILOG("[fetch] cycle " << cycle << " MISPREDICTION PENALTY: stalling for " << mMispredictionPenalty << " cycles (branch_tag=" << redirect.branch_tag
-                                  << ")");
-        } else {
-            ILOG("[fetch] cycle " << cycle << " IGNORING mispred redirect: speculation disabled, no penalty configured");
-        }
-        return;
+    // A retire-time trap/interrupt redirect resolves to the handler path: no misprediction penalty.
+    if (redirect.authoritative) {
+        ILOG("[fetch] cycle " << cycle << " AUTHORITATIVE redirect (retire trap/interrupt): branch_tag=" << redirect.branch_tag
+                              << " fetch_seq=" << redirect.branch_fetch_seq << " target=0x" << std::hex << redirect.correct_target_pc << std::dec);
+        mMispredStallCycles = 0;
     }
-
-    // Filter stale mispred redirects. Speculative (depth>0) and depth=0 mispreds
-    // use different thresholds — see StaleRedirectFilter docs in the header.
-    if (redirect.wrong_path_depth > 0) {
-        if (mStaleFilter.squash_threshold_fetch_seq > 0 && redirect.branch_fetch_seq < mStaleFilter.squash_threshold_fetch_seq) {
-            ILOG("[fetch] cycle " << cycle << " IGNORING stale SPECULATIVE mispred: depth=" << (int)redirect.wrong_path_depth
-                                  << " fetch_seq=" << redirect.branch_fetch_seq << " < threshold=" << mStaleFilter.squash_threshold_fetch_seq);
-            return;
-        }
-    } else if (mStaleFilter.depth0_fetch_seq > 0 && redirect.branch_fetch_seq > mStaleFilter.depth0_branch_fetch_seq &&
-               redirect.branch_fetch_seq < mStaleFilter.depth0_fetch_seq) {
-        // Depth=0 mispred whose branch was fetched strictly inside the last depth=0
-        // recovery's squashed window (after its branch, before its frontier) — it was
-        // flushed by that recovery. fetch_seq is monotonic/never-reused, so this window
-        // test is exact even across model-tag reuse.
-        ILOG("[fetch] cycle " << cycle << " IGNORING stale DEPTH0 mispred: branch_fetch_seq=" << redirect.branch_fetch_seq << " in ("
-                              << mStaleFilter.depth0_branch_fetch_seq << ", " << mStaleFilter.depth0_fetch_seq << ")");
-        return;
-    }
-
-    // Secondary filter: depth check as a safety net
-    // If a mispred comes from a depth deeper than our current depth, it's from a
-    // speculative path that was already recovered from
-    if (redirect.wrong_path_depth > mCurrentWrongPathDepth) {
-        ILOG("[fetch] cycle " << cycle << " IGNORING stale MISPRED redirect: depth=" << (int)redirect.wrong_path_depth
-                              << " > current_depth=" << (int)mCurrentWrongPathDepth);
-        return;
-    }
+    if (!mSpecCfg->enabled && !redirect.authoritative) mMispredStallCycles = mMispredictionPenalty;
+    mAwaitingResolve = false;
 
     ++mNumRedirects;
+    mTakenBubbleCycles = 0;  // the redirect restarts the front end
+    mMispredRedirectCycle = cycle;
 
     // Flush Whisper/ExecutionDriver from branch_tag+1 onwards
     // This must happen at the same time as Fetch receives the redirect to keep them synchronized
@@ -415,31 +464,10 @@ void FetchStructures::receiveMispredRedirect_(const core::BranchRedirect& redire
 
     // Cancel any in-flight packets to ICache that should be squashed
     // (packets on the wrong path that need to be flushed due to misprediction recovery)
-    uint32_t cancelled = request_out.cancelIf([&](const core::FetchRequest& req) -> bool {
-        bool should_cancel = false;
-        for (const auto& pkt : req.packets) {
-            if (core::shouldSquash(pkt.tag, pkt.wrong_path_depth, redirect.branch_tag, redirect.wrong_path_depth, core::FlushSource::Execute)) {
-                ILOG("[fetch] cycle " << cycle << " CANCELLING in-flight tag=" << pkt.tag << " depth=" << (int)pkt.wrong_path_depth << " (mispred recovery)");
-                if (mVis) mVis->onSquash(pkt.fetch_seq, cycle);
-                should_cancel = true;  // Mark for cancellation but continue to call onSquash for all packets
-            }
-        }
-        return should_cancel;
-    });
-
-    if (cancelled > 0) {
-        ILOG("[fetch] cycle " << cycle << " cancelled " << cancelled << " in-flight requests (mispred)");
-    }
+    cancelInFlight_(redirect.branch_tag, redirect.wrong_path_depth, core::FlushSource::Execute);
 
     // When a branch at depth D mispredicts, we return to depth D (the branch itself was at that depth)
     mCurrentWrongPathDepth = redirect.wrong_path_depth;
-
-    // Refresh stale-redirect filter: any branch with fetch_seq < mFetchSeq is now invalid.
-    mStaleFilter.squash_threshold_fetch_seq = mFetchSeq;
-    if (redirect.wrong_path_depth == 0) {
-        mStaleFilter.depth0_fetch_seq = mFetchSeq;                         // upper bound: recovery frontier
-        mStaleFilter.depth0_branch_fetch_seq = redirect.branch_fetch_seq;  // lower bound: recovering branch
-    }
 
     // If we're returning to depth 0, we're back on the correct path
     if (mCurrentWrongPathDepth == 0) {
@@ -458,6 +486,8 @@ void FetchStructures::receiveMispredRedirect_(const core::BranchRedirect& redire
         mDriver->setNextPc(redirect.correct_target_pc);
     }
 }
+
+void FetchStructures::receiveTakenBubble_(const uint32_t& cycles) { mTakenBubbleCycles = std::max(mTakenBubbleCycles, cycles); }
 
 void FetchStructures::receiveBranchResolved_(const core::BranchResolved& resolved) {
     uint64_t cycle = getClock()->currentCycle();

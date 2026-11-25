@@ -5,6 +5,7 @@
 
 #include <array>
 #include <deque>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -19,7 +20,6 @@
 
 namespace midcore {
 class LSQ;
-class BypassNetwork;
 class WritebackBuffer;
 
 class ExecuteParams : public sparta::ParameterSet {
@@ -72,6 +72,7 @@ class Execute : public sparta::Unit {
 
     sparta::DataOutPort<std::vector<core::IssuePacket>> mem_out{&unit_port_set_, "mem_out"};
 
+    // Register write-back, read only by the in-order scoreboard; out-of-order Issue wakes consumers at issue + latency.
     sparta::DataOutPort<std::vector<core::PhysRegRef>> completion_out{&unit_port_set_, "completion_out"};
 
     sparta::DataOutPort<std::vector<core::ROBToken>> rob_complete_out{&unit_port_set_, "rob_complete_out"};
@@ -97,7 +98,6 @@ class Execute : public sparta::Unit {
     void setDownstream(midcore::LSQ* lsq) { mDownstream = lsq; }
     void setArbiter(WritePortArbiter* arb) { mArbiter = arb; }
     void setVisualizer(core::PipelineVisualizer* v) { mVis = v; }
-    void setBypassNetwork(BypassNetwork* bn) { mBypassNetwork = bn; }
     void setWritebackBuffer(WritebackBuffer* wb) { mWritebackBuffer = wb; }
     uint64_t numExecuted() const { return mNumExecuted.get(); }
 
@@ -107,6 +107,7 @@ class Execute : public sparta::Unit {
         uint8_t cycles_remaining;
         bool awaiting_write_port{false};
         bool done_signaled{false};
+        bool resolved{false};
     };
 
     struct FunctionalUnitGroup {
@@ -146,13 +147,13 @@ class Execute : public sparta::Unit {
     void buildTyped(const ExecuteParams* p);
     void buildFunctional(const ExecuteParams* p);
 
+    std::optional<core::FlushRequest> mTickFlush;  // the flush this tick raised; it squashes here next cycle
     std::vector<FunctionalUnitGroup> mGroups;
     std::array<uint8_t, core::kNumUopTypes> mGroupForType{};
 
     midcore::LSQ* mDownstream = nullptr;
     WritePortArbiter* mArbiter = nullptr;
     core::PipelineVisualizer* mVis{nullptr};
-    BypassNetwork* mBypassNetwork{nullptr};
     WritebackBuffer* mWritebackBuffer{nullptr};
 
     std::vector<core::PhysRegRef> mCompletionsBuf;
@@ -163,6 +164,8 @@ class Execute : public sparta::Unit {
     sparta::Counter mNumExecuted;
     sparta::Counter mNumSquashed;
     sparta::Counter mNumMispredictions;
+    sparta::Counter mNumWritePortDenials;
+    sparta::Counter mNumWritePortConflictCycles;
 };
 
 }  // namespace midcore

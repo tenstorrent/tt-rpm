@@ -11,9 +11,10 @@ Third-party components
 ================================================================================
 
 This software is built on and/or integrates with the following third-party
-projects. These components are not distributed as part of this repository; they
-are referenced as git submodules (see .gitmodules) and remain under their own
-licenses. Their copyright and license terms govern your use of those components.
+projects. Except for the files listed under "Vendored files" below, these
+components are not distributed as part of this repository; they are referenced as
+git submodules (see .gitmodules) and remain under their own licenses. Their
+copyright and license terms govern your use of those components.
 
   * Sparta / MAP (https://github.com/sparcians/map)
         — modeling framework. See the upstream repository for license terms.
@@ -35,3 +36,13 @@ licenses. Their copyright and license terms govern your use of those components.
 
 Each submodule retains the copyright notices and license texts provided by its
 respective upstream project.
+
+================================================================================
+Vendored files
+================================================================================
+
+  * tests/rv32/crt.S, tests/rv32/encoding.h, tests/rv32/test.ld
+        — modified copies of files from RISC-V tests
+        (https://github.com/riscv-software-src/riscv-tests).
+        Copyright (c) 2012-2015, The Regents of the University of California.
+        BSD-3-Clause; see tests/rv32/LICENSE.

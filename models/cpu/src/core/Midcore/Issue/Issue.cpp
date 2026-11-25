@@ -7,7 +7,8 @@
 #include <iostream>
 #include <sstream>
 
-#include "Common/BypassNetwork.hpp"
+#include "Common/FpOpClass.hpp"
+#include "Common/ParamChoice.hpp"
 #include "Common/SpeculationUtils.hpp"
 #include "Logging.hpp"
 #include "Midcore/Execute/Execute.hpp"
@@ -39,6 +40,9 @@ std::vector<core::UopType> parseUopTypeList(const std::string& str) {
     return types;
 }
 
+constexpr const char* kUopTypeNames[] = {"ALU", "Mul", "Div", "Branch", "Load", "Store", "FpOp", "VecOp", "Fence"};
+static_assert(std::size(kUopTypeNames) == core::kNumUopTypes);
+
 }  // namespace
 
 namespace midcore {
@@ -46,20 +50,35 @@ namespace midcore {
 Issue::Issue(sparta::TreeNode* node, const IssueParams* params)
     : sparta::Unit(node),
       mScoreboard(params->num_phys_regs),
-      mSpeculativeWakeupEnabled(params->speculative_wakeup),
+      mRegReadLatency(params->regfile_read_latency),
+      mIntDividers(params->int_div_units),
+      mFpDividers(params->fp_div_units),
+      mIntDivInterval(params->int_div_interval),
+      mFpDivSInterval(params->fp_div_s_interval),
+      mFpDivDInterval(params->fp_div_d_interval),
       mNumIssued(&unit_stat_set_, "num_issued", "Total instructions issued", sparta::Counter::COUNT_NORMAL),
-      mNumStallCycles(&unit_stat_set_, "num_stall_cycles", "Cycles issue stalled on RAW hazard", sparta::Counter::COUNT_NORMAL),
-      mNumSpeculativeWakeups(&unit_stat_set_, "num_speculative_wakeups", "Speculative wakeups fired", sparta::Counter::COUNT_NORMAL),
+      mNumStallCycles(&unit_stat_set_, "num_stall_cycles", "Cycles with uops in the schedulers and none issued", sparta::Counter::COUNT_NORMAL),
+      mNumLoadHitWakeups(&unit_stat_set_, "num_load_hit_wakeups", "Load destinations woken from the D-cache hit, ahead of write-back",
+                         sparta::Counter::COUNT_NORMAL),
+      mNumPortConflicts(&unit_stat_set_, "num_port_conflicts", "Ready uop-cycles held because no free issue port accepts the uop type",
+                        sparta::Counter::COUNT_NORMAL),
+      mNumIntDivBusy(&unit_stat_set_, "num_int_div_busy", "Ready divide uop-cycles held because every integer divider was busy", sparta::Counter::COUNT_NORMAL),
+      mNumFpDivBusy(&unit_stat_set_, "num_fp_div_busy", "Ready FP divide/sqrt uop-cycles held because every FP divider was busy",
+                    sparta::Counter::COUNT_NORMAL),
+      mNumIntDivIssued(&unit_stat_set_, "num_int_div_issued", "Divides issued to an integer divider (busy int_div_interval cycles each)",
+                       sparta::Counter::COUNT_NORMAL),
+      mNumFpDivIssued(&unit_stat_set_, "num_fp_div_issued", "FP and vector divides and square roots issued to an FP divider", sparta::Counter::COUNT_NORMAL),
       mNumDepLocalRoutes(&unit_stat_set_, "num_dep_local_routes", "Times dependency locality routing succeeded", sparta::Counter::COUNT_NORMAL),
       mNumDepLocalFallback(&unit_stat_set_, "num_dep_local_fallback", "Times dependency locality routing fell back", sparta::Counter::COUNT_NORMAL),
       mNumTypeAffinityRoutes(&unit_stat_set_, "num_type_affinity_routes", "Times type affinity routing used", sparta::Counter::COUNT_NORMAL),
       mNumLeastOccupiedRoutes(&unit_stat_set_, "num_least_occupied_routes", "Times least-occupied routing used", sparta::Counter::COUNT_NORMAL),
       mNumRoundRobinRoutes(&unit_stat_set_, "num_round_robin_routes", "Times round-robin routing used", sparta::Counter::COUNT_NORMAL),
-      mNumOldestSelected(&unit_stat_set_, "num_oldest_selected", "Times oldest ready was selected", sparta::Counter::COUNT_NORMAL),
-      mNumNotOldestSelected(&unit_stat_set_, "num_not_oldest_selected", "Times non-oldest ready was selected", sparta::Counter::COUNT_NORMAL),
+      mNumOldestSelected(&unit_stat_set_, "num_oldest_selected", "Uops issued with no older ready uop left waiting in their scheduler",
+                         sparta::Counter::COUNT_NORMAL),
+      mNumNotOldestSelected(&unit_stat_set_, "num_not_oldest_selected", "Uops issued ahead of an older ready uop in their scheduler that could not issue",
+                            sparta::Counter::COUNT_NORMAL),
       mNumSquashed(&unit_stat_set_, "num_squashed", "Instructions squashed due to flush", sparta::Counter::COUNT_NORMAL) {
     in_port.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(Issue, receivePackets_, std::vector<core::RenamedPacket>));
-    completion_exe_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(Issue, receiveExeCompletions_, std::vector<core::PhysRegRef>));
     completion_lsq_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(Issue, receiveLsqCompletions_, std::vector<core::PhysRegRef>));
     flush_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(Issue, receiveFlush_, core::FlushRequest));
     branch_resolved_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(Issue, receiveBranchResolved_, core::BranchResolved));
@@ -77,15 +96,21 @@ Issue::Issue(sparta::TreeNode* node, const IssueParams* params)
         mSelectionMode = SelectionMode::FIFO;
     } else if (sel == "random") {
         mSelectionMode = SelectionMode::Random;
+    } else {
+        sparta_assert(false, params->selection.getLocation() << " = '" << sel << "'; expected one of: age_matrix, fifo, random");
     }
 
-    std::string mode = params->mode;
+    std::string mode = core::checkChoice(params->mode, {"unified", "partitioned"});
     uint32_t iq_capacity = params->issue_queue_capacity;
     uint32_t iq_width = params->issue_width;
 
+    const std::vector<std::string> port_specs = params->issue_ports;
     if (mode == "partitioned") {
+        sparta_assert(port_specs.empty(), params->issue_ports.getLocation()
+                                              << " applies to unified mode only; partitioned mode takes ports from scheduler_configs");
         // Parse scheduler_configs: "name:capacity:types" per entry
         std::vector<std::string> sched_strs = params->scheduler_configs;
+        sparta_assert(!sched_strs.empty(), params->scheduler_configs.getLocation() << " is empty; partitioned mode needs at least one scheduler");
         std::vector<SchedulerConfig> sched_configs;
         for (const auto& s : sched_strs) {
             std::istringstream ss(s);
@@ -107,14 +132,12 @@ Issue::Issue(sparta::TreeNode* node, const IssueParams* params)
             }
             sched_configs.push_back(std::move(scfg));
         }
-        if (!sched_configs.empty()) {
-            configurePartitioned(sched_configs);
-        }
+        configurePartitioned(sched_configs);
 
         // Parse routing priorities
         std::vector<std::string> prio_strs = params->routing_priorities;
+        RoutingConfig rcfg;
         if (!prio_strs.empty()) {
-            RoutingConfig rcfg;
             rcfg.priorities.clear();
             for (const auto& p : prio_strs) {
                 if (p == "dependency_locality")
@@ -125,33 +148,31 @@ Issue::Issue(sparta::TreeNode* node, const IssueParams* params)
                     rcfg.priorities.push_back(RoutingPriority::LeastOccupied);
                 else if (p == "round_robin")
                     rcfg.priorities.push_back(RoutingPriority::RoundRobin);
+                else
+                    sparta_assert(false, params->routing_priorities.getLocation()
+                                             << ": unknown '" << p << "'; expected dependency_locality, type_affinity, least_occupied or round_robin");
             }
-            rcfg.dependency_occupancy_limit = static_cast<float>(static_cast<double>(params->routing_dep_occupancy_limit));
-            rcfg.overflow_threshold = static_cast<float>(static_cast<double>(params->routing_overflow_threshold));
-            configureRouting(rcfg);
         }
+        rcfg.dependency_occupancy_limit = static_cast<float>(static_cast<double>(params->routing_dep_occupancy_limit));
+        configureRouting(rcfg);
     } else {
-        buildUnified(iq_capacity, iq_width);
+        buildUnified(iq_capacity, iq_width, port_specs);
     }
 
-    // Read all remaining params (consumed by ChipSim during binding or unused in this mode)
-    (void)static_cast<bool>(params->bypass_network_enabled);
-    (void)static_cast<uint32_t>(params->bypass_regfile_read_latency);
-    (void)params->bypass_paths.getValue();
+    // Read all remaining params (unused in this mode)
     if (mode != "partitioned") {
         (void)params->scheduler_configs.getValue();
         (void)params->routing_priorities.getValue();
         (void)static_cast<double>(params->routing_dep_occupancy_limit);
-        (void)static_cast<double>(params->routing_overflow_threshold);
     }
 
-    ILOG("[issue] mode=" << mode << " selection=" << sel << " speculative_wakeup=" << mSpeculativeWakeupEnabled << " schedulers=" << mSchedulers.size());
+    ILOG("[issue] mode=" << mode << " selection=" << sel << " regfile_read_latency=" << mRegReadLatency << " schedulers=" << mSchedulers.size());
 
     // Initialize pending reservations tracking
     mPendingReservations.assign(mSchedulers.size(), 0);
 }
 
-void Issue::buildUnified(uint32_t capacity, uint32_t width) {
+void Issue::buildUnified(uint32_t capacity, uint32_t width, const std::vector<std::string>& port_specs) {
     mSchedulers.clear();
 
     IssueScheduler sched;
@@ -162,11 +183,18 @@ void Issue::buildUnified(uint32_t capacity, uint32_t width) {
     sched.primary_types = {core::UopType::ALU,   core::UopType::Mul,  core::UopType::Div,   core::UopType::Branch, core::UopType::Load,
                            core::UopType::Store, core::UopType::FpOp, core::UopType::VecOp, core::UopType::Fence};
 
+    sparta_assert(port_specs.empty() || port_specs.size() == width,
+                  "issue.params.issue_ports lists " << port_specs.size() << " ports but issue.params.issue_width is " << width);
     for (uint32_t i = 0; i < width; ++i) {
         IssuePort port;
         port.name = "unified_p" + std::to_string(i);
-        port.served_types = sched.primary_types;
+        port.served_types = port_specs.empty() ? sched.primary_types : parseUopTypeList(port_specs[i]);
         sched.ports.push_back(std::move(port));
+    }
+    for (size_t t = 0; t < kNumUopTypes; ++t) {
+        bool served = false;
+        for (const auto& p : sched.ports) served |= p.canServe(static_cast<core::UopType>(t));
+        sparta_assert(served, "issue.params.issue_ports: no port accepts uop type " << kUopTypeNames[t]);
     }
 
     mSchedulers.push_back(std::move(sched));
@@ -195,7 +223,6 @@ void Issue::buildPartitioned(const std::vector<SchedulerConfig>& configs) {
         sched.name = cfg.name;
         sched.init(cfg.capacity);
         sched.primary_types = cfg.types;
-        sched.accepts_types = cfg.accepts;
 
         for (const auto& port_cfg : cfg.ports) {
             IssuePort port;
@@ -213,14 +240,7 @@ void Issue::buildPartitioned(const std::vector<SchedulerConfig>& configs) {
             mEligibleSchedulers[ti].push_back(sched_idx);
         }
 
-        // Add to eligible list for accepted types too
-        for (auto t : cfg.accepts) {
-            uint8_t ti = static_cast<uint8_t>(t);
-            mEligibleSchedulers[ti].push_back(sched_idx);
-        }
-
-        ILOG("[issue] scheduler '" << cfg.name << "': capacity=" << cfg.capacity << " ports=" << sched.ports.size() << " primary_types=" << cfg.types.size()
-                                   << " accepts=" << cfg.accepts.size());
+        ILOG("[issue] scheduler '" << cfg.name << "': capacity=" << cfg.capacity << " ports=" << sched.ports.size() << " primary_types=" << cfg.types.size());
 
         mSchedulers.push_back(std::move(sched));
         ++sched_idx;
@@ -241,8 +261,9 @@ void Issue::buildPartitioned(const std::vector<SchedulerConfig>& configs) {
 
 void Issue::recordProducerScheduler(const std::vector<core::PhysRegRef>& dsts, uint8_t sched_idx) {
     for (const auto& dst : dsts) {
-        size_t type_idx = static_cast<size_t>(dst.type);
-        if (type_idx < kNumRegTypes && dst.phys_reg < mProducerScheduler[type_idx].size()) {
+        if (!core::isRegFileType(dst.type)) continue;
+        size_t type_idx = core::regTypeIndex(dst.type);
+        if (dst.phys_reg < mProducerScheduler[type_idx].size()) {
             mProducerScheduler[type_idx][dst.phys_reg] = sched_idx;
         }
     }
@@ -250,16 +271,18 @@ void Issue::recordProducerScheduler(const std::vector<core::PhysRegRef>& dsts, u
 
 void Issue::clearProducerScheduler(const std::vector<core::PhysRegRef>& dsts) {
     for (const auto& dst : dsts) {
-        size_t type_idx = static_cast<size_t>(dst.type);
-        if (type_idx < kNumRegTypes && dst.phys_reg < mProducerScheduler[type_idx].size()) {
+        if (!core::isRegFileType(dst.type)) continue;
+        size_t type_idx = core::regTypeIndex(dst.type);
+        if (dst.phys_reg < mProducerScheduler[type_idx].size()) {
             mProducerScheduler[type_idx][dst.phys_reg] = kNoScheduler;
         }
     }
 }
 
 uint8_t Issue::getProducerScheduler(const core::PhysRegRef& src) const {
-    size_t type_idx = static_cast<size_t>(src.type);
-    if (type_idx < kNumRegTypes && src.phys_reg < mProducerScheduler[type_idx].size()) {
+    if (!core::isRegFileType(src.type)) return kNoScheduler;
+    size_t type_idx = core::regTypeIndex(src.type);
+    if (src.phys_reg < mProducerScheduler[type_idx].size()) {
         return mProducerScheduler[type_idx][src.phys_reg];
     }
     return kNoScheduler;
@@ -302,17 +325,22 @@ uint8_t Issue::selectScheduler(const core::RenamedPacket& rpkt) {
                 break;
         }
 
-        if (result != kNoScheduler && !mSchedulers[result].isFull()) {
+        if (result != kNoScheduler && hasRoom_(result)) {
             ILOG("[issue] tag=" << rpkt.pkt.tag << " routed to scheduler " << static_cast<int>(result) << " (" << mSchedulers[result].name << ") via "
                                 << routingPriorityName(prio));
             return result;
         }
     }
 
-    // Ultimate fallback: primary scheduler for type
-    uint8_t fallback = mSchedulerForType[static_cast<uint8_t>(rpkt.uop_type)];
-    ILOG("[issue] tag=" << rpkt.pkt.tag << " routed to scheduler " << static_cast<int>(fallback) << " (" << mSchedulers[fallback].name << ") via fallback");
-    return fallback;
+    // Fallback: the first scheduler with room that accepts the type; the primary one is listed first.
+    const uint8_t ti = static_cast<uint8_t>(rpkt.uop_type);
+    for (uint8_t fallback : mEligibleSchedulers[ti]) {
+        if (!hasRoom_(fallback)) continue;
+        ILOG("[issue] tag=" << rpkt.pkt.tag << " routed to scheduler " << static_cast<int>(fallback) << " (" << mSchedulers[fallback].name << ") via fallback");
+        return fallback;
+    }
+    sparta_assert(false, "no issue scheduler has room for uop type " << kUopTypeNames[ti] << "; Rename must check isReadyForType first");
+    return kNoScheduler;
 }
 
 uint8_t Issue::selectByDependency(const core::RenamedPacket& rpkt) {
@@ -332,7 +360,7 @@ uint8_t Issue::selectByDependency(const core::RenamedPacket& rpkt) {
     }
 
     // Check occupancy limit
-    if (sched.occupancy() > mRoutingConfig.dependency_occupancy_limit) {
+    if (occupancy_(hint) > mRoutingConfig.dependency_occupancy_limit) {
         ILOG("[issue] dependency_locality: tag=" << rpkt.pkt.tag << " producer_sched=" << sched.name << " over occupancy limit");
         ++mNumDepLocalFallback;
         return kNoScheduler;
@@ -344,7 +372,7 @@ uint8_t Issue::selectByDependency(const core::RenamedPacket& rpkt) {
 
 uint8_t Issue::selectByType(core::UopType t) {
     uint8_t primary = mSchedulerForType[static_cast<uint8_t>(t)];
-    if (primary != kNoScheduler && !mSchedulers[primary].isFull()) {
+    if (primary != kNoScheduler && hasRoom_(primary)) {
         ++mNumTypeAffinityRoutes;
         return primary;
     }
@@ -359,9 +387,8 @@ uint8_t Issue::selectLeastOccupied(core::UopType t) {
     float best_occ = 2.0f;  // > 1.0 so first non-full wins
 
     for (uint8_t si : eligible) {
-        auto& sched = mSchedulers[si];
-        if (sched.isFull()) continue;
-        float occ = sched.occupancy();
+        if (!hasRoom_(si)) continue;
+        float occ = occupancy_(si);
         if (occ < best_occ) {
             best_occ = occ;
             best = si;
@@ -385,7 +412,7 @@ uint8_t Issue::selectRoundRobin(core::UopType t) {
     for (size_t i = 0; i < eligible.size(); ++i) {
         size_t idx = (start + i) % eligible.size();
         uint8_t si = eligible[idx];
-        if (!mSchedulers[si].isFull()) {
+        if (hasRoom_(si)) {
             counter = static_cast<uint8_t>((idx + 1) % eligible.size());
             ++mNumRoundRobinRoutes;
             return si;
@@ -393,6 +420,12 @@ uint8_t Issue::selectRoundRobin(core::UopType t) {
     }
 
     return kNoScheduler;
+}
+
+uint8_t Issue::reserveSlot(const core::RenamedPacket& rpkt) {
+    uint8_t si = selectScheduler(rpkt);
+    ++mPendingReservations[si];
+    return si;
 }
 
 // ============================================================================
@@ -444,8 +477,7 @@ void Issue::receivePackets_(const std::vector<core::RenamedPacket>& pkts) {
             mScoreboard.markNotReady(dst.phys_reg, dst.type);
         }
 
-        // Select scheduler using priority chain
-        uint8_t sched_idx = selectScheduler(rpkt);
+        uint8_t sched_idx = rpkt.scheduler;
         sparta_assert(sched_idx < mSchedulers.size(), "Invalid scheduler index");
 
         // Insert into scheduler
@@ -459,20 +491,21 @@ void Issue::receivePackets_(const std::vector<core::RenamedPacket>& pkts) {
     }
 }
 
-void Issue::receiveExeCompletions_(const std::vector<core::PhysRegRef>& completions) {
-    // When speculative wakeup is enabled, it owns the timing for non-memory ops
-    if (mSpeculativeWakeupEnabled) return;
-
+void Issue::receiveLsqCompletions_(const std::vector<core::PhysRegRef>& completions) {
+    // Load write-back: wakes loads that wakeOnLoadData() did not (misses, forwarded, multi-line).
+    const uint64_t cycle = getClock()->currentCycle();
     for (const auto& ref : completions) {
-        mScoreboard.markReady(ref.phys_reg, ref.type);
+        mScoreboard.readyAt(ref.phys_reg, ref.type, cycle);
     }
 }
 
-void Issue::receiveLsqCompletions_(const std::vector<core::PhysRegRef>& completions) {
-    // Load completions from LSQ - always mark scoreboard
-    for (const auto& ref : completions) {
-        mScoreboard.markReady(ref.phys_reg, ref.type);
+void Issue::wakeOnLoadData(const std::vector<core::PhysRegRef>& dsts, uint64_t data_cycle) {
+    // A consumer issued at c executes at c + regfile_read_latency + 1.
+    const uint64_t issue_cycle = data_cycle > mRegReadLatency ? data_cycle - mRegReadLatency - 1 : 0;
+    for (const auto& ref : dsts) {
+        mScoreboard.readyAt(ref.phys_reg, ref.type, issue_cycle);
     }
+    ++mNumLoadHitWakeups;
 }
 
 void Issue::receiveFlush_(const core::FlushRequest& req) {
@@ -501,8 +534,22 @@ void Issue::receiveFlush_(const core::FlushRequest& req) {
         });
     }
 
-    // Pending speculative wakeups carry no tag, so they are not filtered here;
-    // they expire on their own schedule.
+    for (auto it = mRegReadPipe.begin(); it != mRegReadPipe.end();) {
+        if (core::shouldSquash(it->second.pkt, req)) {
+            if (mVis) mVis->onSquash(it->second.pkt.fetch_seq, cycle);
+            it = mRegReadPipe.erase(it);
+            ++total_squashed;
+        } else {
+            ++it;
+        }
+    }
+
+    // A squashed divide frees its unit, as Execute drops it on the same predicate.
+    for (auto* units : {&mIntDividers, &mFpDividers}) {
+        for (auto& u : *units) {
+            if (u.busy_until > cycle && core::shouldSquash(u.holder, req)) u.busy_until = 0;
+        }
+    }
 
     mNumSquashed += total_squashed;
     ILOG("[issue] cycle " << cycle << " Squashed " << total_squashed << " entries");
@@ -514,79 +561,13 @@ void Issue::receiveBranchResolved_(const core::BranchResolved& resolved) {
     uint32_t num_decremented = 0;
 
     for (auto& sched : mSchedulers) {
-        num_decremented += sched.decrementDepth(resolved.branch_tag, resolved.resolved_depth);
+        num_decremented += sched.decrementDepth(resolved);
     }
 
     if (num_decremented > 0) {
         ILOG("[issue] cycle " << cycle << " BRANCH RESOLVED: tag=" << resolved.branch_tag << " depth=" << static_cast<int>(resolved.resolved_depth)
                               << " decremented " << num_decremented << " entries");
     }
-}
-
-// ============================================================================
-// Speculative Wakeup
-// ============================================================================
-
-void Issue::processSpeculativeWakeups() {
-    if (!mSpeculativeWakeupEnabled) return;
-
-    for (auto it = mPendingWakeups.begin(); it != mPendingWakeups.end();) {
-        if (--it->cycles_remaining == 0) {
-            for (const auto& dst : it->phys_dsts) {
-                mScoreboard.markReady(dst.phys_reg, dst.type);
-            }
-            ++mNumSpeculativeWakeups;
-            it = mPendingWakeups.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
-void Issue::scheduleSpeculativeWakeup(const core::IssuePacket& ipkt) {
-    if (!mSpeculativeWakeupEnabled) return;
-    if (isMemoryType(ipkt.uop_type)) return;
-    if (ipkt.phys_dsts.empty()) return;
-
-    // Compute wakeup latency based on bypass network availability.
-    //
-    // Timeline for a dependent consumer:
-    //   Producer issues at cycle N
-    //   Producer completes execution at N + exec_latency
-    //
-    //   WITH BYPASS (enabled, path exists):
-    //     Result available to consumer at: N + exec_latency + bypass_path_latency
-    //     Typically bypass_path_latency = 0 (same cycle as exec completes)
-    //
-    //   WITHOUT BYPASS (disabled, or no path):
-    //     Producer writes to PRF, consumer reads from PRF
-    //     Result available at: N + exec_latency + prf_read_latency
-    //     Typically prf_read_latency = 1 (one extra cycle to read from regfile)
-    //
-    uint8_t base_latency = ipkt.latency;  // Execution latency
-    uint8_t additional_latency = 0;
-
-    if (mBypassNetwork && mBypassNetwork->enabled()) {
-        // Get minimum bypass latency for this producer type
-        uint8_t producer_fu = static_cast<uint8_t>(ipkt.uop_type);
-        uint8_t bypass_lat = mBypassNetwork->getMinBypassLatency(producer_fu);
-
-        if (bypass_lat != BypassNetwork::kNoBypass) {
-            // Bypass path exists - use bypass latency (typically 0)
-            additional_latency = bypass_lat;
-        } else {
-            // No bypass path configured for this FU - fall back to PRF read
-            additional_latency = mBypassNetwork->regfileReadLatency();
-        }
-    } else {
-        // Bypass disabled - consumer must wait for PRF read
-        // Use a default of 1 cycle if no bypass network configured
-        additional_latency = mBypassNetwork ? mBypassNetwork->regfileReadLatency() : 1;
-    }
-
-    uint8_t wakeup_latency = base_latency + additional_latency;
-
-    mPendingWakeups.emplace_back(PendingWakeup{.phys_dsts = ipkt.phys_dsts, .cycles_remaining = wakeup_latency});
 }
 
 // ============================================================================
@@ -607,20 +588,81 @@ void Issue::selectFromScheduler(IssueScheduler& sched) {
     }
 }
 
-bool Issue::sourcesReadyWithBypass(const std::vector<core::PhysRegRef>& phys_srcs) const {
-    // With the new bypass-aware speculative wakeup, the scoreboard is updated
-    // at the appropriate time (accounting for bypass path latency or PRF read latency).
-    // Selection just needs to check the scoreboard.
-    return mScoreboard.sourcesReady(phys_srcs);
+UnpipelinedUnit* Issue::unpipelinedUnitFor(core::UopType t, const core::PipelinePacket& pkt, bool& blocked) {
+    std::vector<UnpipelinedUnit>* units = nullptr;
+    if (t == core::UopType::Div) {
+        units = &mIntDividers;
+    } else if (pkt.inst && ((t == core::UopType::FpOp && core::fpOpClass(pkt.inst->getTraceRecord().inst) == core::FpOpClass::DivSqrt) ||
+                            (t == core::UopType::VecOp && core::vecFpIsDivSqrt(pkt.inst->getTraceRecord().inst)))) {
+        units = &mFpDividers;
+    }
+    if (!units || units->empty()) return nullptr;
+
+    const uint64_t cycle = getClock()->currentCycle();
+    for (auto& u : *units) {
+        if (u.busy_until <= cycle) return &u;
+    }
+    blocked = true;
+    ++(units == &mIntDividers ? mNumIntDivBusy : mNumFpDivBusy);
+    return nullptr;
 }
 
-void Issue::issueInstruction(IssueScheduler& sched, uint32_t slot, IssuePort& port) {
+bool Issue::canIssue(IssueScheduler& sched, const core::RenamedPacket& rpkt, IssuePort*& port, UnpipelinedUnit*& unit) {
+    bool blocked = false;
+    unit = unpipelinedUnitFor(rpkt.uop_type, rpkt.pkt, blocked);
+    if (blocked) return false;
+    port = sched.findAvailablePort(rpkt.uop_type);
+    if (!port) {
+        ++mNumPortConflicts;
+        return false;
+    }
+    if (!mDownstream->isReadyForType(rpkt.uop_type)) return false;
+    if (mPrf && mPrf->bankingEnabled() && !mPrf->canReadRegs(rpkt.phys_srcs)) return false;
+    return true;
+}
+
+// The interval is the divider's issue interval (reciprocal throughput); the result still takes the full latency.
+void Issue::occupyUnit_(UnpipelinedUnit& unit, core::UopType t, const core::PipelinePacket& pkt, uint8_t latency) {
+    uint32_t interval = mIntDivInterval;
+    if (t == core::UopType::Div) {
+        ++mNumIntDivIssued;
+    } else {
+        interval = pkt.inst->getFpDivPrecision() == cpu::FpDivPrecision::Single ? mFpDivSInterval : mFpDivDInterval;
+        ++mNumFpDivIssued;
+    }
+    unit.busy_until = getClock()->currentCycle() + (interval ? interval : latency);
+    unit.holder = pkt;
+}
+
+bool Issue::issueInorder(const core::DecodePacket& dp) {
+    const uint64_t cycle = getClock()->currentCycle();
+    if (mInorderPortCycle != cycle) {
+        for (auto& s : mSchedulers) s.resetPorts();
+        mInorderPortCycle = cycle;
+    }
+    bool blocked = false;
+    UnpipelinedUnit* unit = unpipelinedUnitFor(dp.uop_type, dp.pkt, blocked);
+    if (blocked) return false;
+    IssuePort* port = mSchedulers[mSchedulerForType[static_cast<uint8_t>(dp.uop_type)]].findAvailablePort(dp.uop_type);
+    if (!port) {
+        ++mNumPortConflicts;
+        return false;
+    }
+    port->used_this_cycle = true;
+    if (unit) occupyUnit_(*unit, dp.uop_type, dp.pkt, dp.latency);
+    ++mNumIssued;
+    return true;
+}
+
+void Issue::issueInstruction(IssueScheduler& sched, uint32_t slot, IssuePort& port, UnpipelinedUnit* unit) {
     auto& entry = sched.slots[slot];
     sparta_assert(entry.pkt.has_value(), "Selected empty slot");
     const auto& rpkt = *entry.pkt;
+    const uint64_t cycle = getClock()->currentCycle();
 
     port.used_this_cycle = true;
     mDownstream->reserveSlot(rpkt.uop_type);
+    if (unit) occupyUnit_(*unit, rpkt.uop_type, rpkt.pkt, rpkt.latency);
 
     if (mPrf && mPrf->bankingEnabled()) {
         mPrf->consumeReads(rpkt.phys_srcs);
@@ -630,22 +672,31 @@ void Issue::issueInstruction(IssueScheduler& sched, uint32_t slot, IssuePort& po
 
     ILOG("[issue] selected tag=" << ipkt.pkt.tag << " (slot=" << slot << ") from " << sched.name);
 
-    if (mVis) mVis->onIssue(ipkt.pkt.fetch_seq, getClock()->currentCycle());
+    if (mVis) mVis->onIssue(ipkt.pkt.fetch_seq, cycle);
 
-    scheduleSpeculativeWakeup(ipkt);
+    // Fixed-latency results reach consumers on the bypass; loads and atomics wake when their data is known.
+    if (ipkt.uop_type != core::UopType::Load && ipkt.pkt.inst_class != cpu::InstClass::Atomic) {
+        for (const auto& dst : ipkt.phys_dsts) mScoreboard.readyAt(dst.phys_reg, dst.type, cycle + ipkt.latency);
+    }
 
     mToIssueBuf.push_back(std::move(ipkt));
     sched.remove(slot);
 }
 
+void Issue::countSelection_(const IssueScheduler& sched, uint32_t slot, std::bitset<kMaxIQSlots>& waiting) {
+    ++(sched.ages.selectOldest(waiting) == slot ? mNumOldestSelected : mNumNotOldestSelected);
+    waiting.reset(slot);
+}
+
 void Issue::selectAgeMatrix(IssueScheduler& sched) {
     // Build ready mask - consider both scoreboard and bypass network
     // Only iterate over valid (occupied) slots using the age matrix valid mask
+    const uint64_t cycle = getClock()->currentCycle();
     std::bitset<kMaxIQSlots> ready_mask;
     const auto& valid_mask = sched.ages.validMask();
     for (uint32_t slot = 0; slot < sched.capacity; ++slot) {
         if (!valid_mask.test(slot)) continue;
-        if (sourcesReadyWithBypass(sched.slots[slot].pkt->phys_srcs)) {
+        if (mScoreboard.sourcesReady(sched.slots[slot].pkt->phys_srcs, cycle)) {
             ready_mask.set(slot);
         }
     }
@@ -656,34 +707,21 @@ void Issue::selectAgeMatrix(IssueScheduler& sched) {
     }
 
     // Repeatedly select oldest ready until no more ports or no more ready
+    auto waiting = ready_mask;
     while (ready_mask.any()) {
         uint32_t oldest_slot = sched.ages.selectOldest(ready_mask);
         if (oldest_slot == kInvalidSlot) break;
 
-        const auto& rpkt = *sched.slots[oldest_slot].pkt;
-
-        IssuePort* port = sched.findAvailablePort(rpkt.uop_type);
-        if (!port) {
+        IssuePort* port = nullptr;
+        UnpipelinedUnit* unit = nullptr;
+        if (!canIssue(sched, *sched.slots[oldest_slot].pkt, port, unit)) {
             ready_mask.reset(oldest_slot);
-            ++mNumNotOldestSelected;
             continue;
         }
 
-        if (!mDownstream->isReadyForType(rpkt.uop_type)) {
-            ready_mask.reset(oldest_slot);
-            ++mNumNotOldestSelected;
-            continue;
-        }
-
-        if (mPrf && mPrf->bankingEnabled() && !mPrf->canReadRegs(rpkt.phys_srcs)) {
-            ready_mask.reset(oldest_slot);
-            ++mNumNotOldestSelected;
-            continue;
-        }
-
-        issueInstruction(sched, oldest_slot, *port);
+        countSelection_(sched, oldest_slot, waiting);
+        issueInstruction(sched, oldest_slot, *port, unit);
         ready_mask.reset(oldest_slot);
-        ++mNumOldestSelected;
     }
 }
 
@@ -691,51 +729,54 @@ void Issue::selectFIFO(IssueScheduler& sched) {
     // Iterate slots in order (0 to N-1), treating lower index as "older"
     // This is a simplified FIFO that doesn't perfectly match deque ordering
     // but is consistent with slot-based storage
+    const uint64_t cycle = getClock()->currentCycle();
+    std::bitset<kMaxIQSlots> waiting;
+    for (uint32_t slot = 0; slot < sched.capacity; ++slot) {
+        if (sched.slots[slot].pkt && mScoreboard.sourcesReady(sched.slots[slot].pkt->phys_srcs, cycle)) waiting.set(slot);
+    }
     for (uint32_t slot = 0; slot < sched.capacity; ++slot) {
         auto& entry = sched.slots[slot];
         if (!entry.pkt.has_value()) continue;
 
         const auto& rpkt = *entry.pkt;
 
-        if (!sourcesReadyWithBypass(rpkt.phys_srcs)) continue;
+        if (!mScoreboard.sourcesReady(rpkt.phys_srcs, cycle)) continue;
 
-        IssuePort* port = sched.findAvailablePort(rpkt.uop_type);
-        if (!port) continue;
+        IssuePort* port = nullptr;
+        UnpipelinedUnit* unit = nullptr;
+        if (!canIssue(sched, rpkt, port, unit)) continue;
 
-        if (!mDownstream->isReadyForType(rpkt.uop_type)) continue;
-
-        if (mPrf && mPrf->bankingEnabled() && !mPrf->canReadRegs(rpkt.phys_srcs)) continue;
-
-        issueInstruction(sched, slot, *port);
+        waiting.set(slot);  // may have been woken this cycle by a zero-latency producer
+        countSelection_(sched, slot, waiting);
+        issueInstruction(sched, slot, *port, unit);
     }
 }
 
 void Issue::selectRandom(IssueScheduler& sched) {
     // Build list of ready slots (considering bypass network)
+    const uint64_t cycle = getClock()->currentCycle();
     std::vector<uint32_t> ready_slots;
     for (uint32_t slot = 0; slot < sched.capacity; ++slot) {
         if (!sched.slots[slot].pkt.has_value()) continue;
-        if (sourcesReadyWithBypass(sched.slots[slot].pkt->phys_srcs)) {
+        if (mScoreboard.sourcesReady(sched.slots[slot].pkt->phys_srcs, cycle)) {
             ready_slots.push_back(slot);
         }
     }
 
     std::shuffle(ready_slots.begin(), ready_slots.end(), mRng);
+    std::bitset<kMaxIQSlots> waiting;
+    for (uint32_t slot : ready_slots) waiting.set(slot);
 
     for (uint32_t slot : ready_slots) {
         auto& entry = sched.slots[slot];
         if (!entry.pkt.has_value()) continue;
 
-        const auto& rpkt = *entry.pkt;
+        IssuePort* port = nullptr;
+        UnpipelinedUnit* unit = nullptr;
+        if (!canIssue(sched, *entry.pkt, port, unit)) continue;
 
-        IssuePort* port = sched.findAvailablePort(rpkt.uop_type);
-        if (!port) continue;
-
-        if (!mDownstream->isReadyForType(rpkt.uop_type)) continue;
-
-        if (mPrf && mPrf->bankingEnabled() && !mPrf->canReadRegs(rpkt.phys_srcs)) continue;
-
-        issueInstruction(sched, slot, *port);
+        countSelection_(sched, slot, waiting);
+        issueInstruction(sched, slot, *port, unit);
     }
 }
 
@@ -744,16 +785,9 @@ void Issue::selectRandom(IssueScheduler& sched) {
 // ============================================================================
 
 void Issue::tick() {
-    processSpeculativeWakeups();
-
     // Reset register file bank usage for this cycle
     if (mPrf && mPrf->bankingEnabled()) {
         mPrf->resetBanks();
-    }
-
-    // Tick bypass network
-    if (mBypassNetwork && mBypassNetwork->enabled()) {
-        mBypassNetwork->tick(getClock()->currentCycle());
     }
 
     mToIssueBuf.clear();
@@ -774,8 +808,19 @@ void Issue::tick() {
         if (has_work) ++mNumStallCycles;
     } else {
         mNumIssued += mToIssueBuf.size();
-        out_port.send(mToIssueBuf, 1);
     }
+    sendRegReadStage();
+}
+
+void Issue::sendRegReadStage() {
+    const uint64_t cycle = getClock()->currentCycle();
+    for (auto& ipkt : mToIssueBuf) mRegReadPipe.emplace_back(cycle + mRegReadLatency, std::move(ipkt));
+    mToIssueBuf.clear();
+    while (!mRegReadPipe.empty() && mRegReadPipe.front().first <= cycle) {
+        mToIssueBuf.push_back(std::move(mRegReadPipe.front().second));
+        mRegReadPipe.pop_front();
+    }
+    if (!mToIssueBuf.empty()) out_port.send(mToIssueBuf, 1);
 }
 
 }  // namespace midcore

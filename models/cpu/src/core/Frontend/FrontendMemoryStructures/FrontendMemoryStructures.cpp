@@ -5,11 +5,16 @@
 
 #include <iostream>
 
+#include "Common/L1RequestAggregator.hpp"
+#include "Common/ParamChoice.hpp"
 #include "Common/PipelineVisualizer.hpp"
 #include "Common/SpeculationUtils.hpp"
+#include "Frontend/DecodeStructures/DecodeStructures.hpp"
 #include "Frontend/FetchQueue/FetchQueue.hpp"
 #include "Logging.hpp"
 #include "MemoryHierarchy/L2Cache.hpp"
+#include "prefetch/common/PrefetcherRegistry.hpp"
+#include "prefetch/prefetcher/src/InstructionPrefetcherInterface.hpp"
 
 namespace frontend {
 
@@ -22,8 +27,26 @@ FrontendMemoryStructures::FrontendMemoryStructures(sparta::TreeNode* node, const
     mHitLatency = params->hit_latency;
     mMissLatency = params->miss_latency;
     mMshrCapacity = params->mshr_capacity;
-    mStructuralMode = (params->cache_mode == "structural");
+    mStructuralMode = core::checkChoice(params->cache_mode, {"probabilistic", "structural"}) == "structural";
     mRng.seed(params->rng_seed);
+
+    mPfMshrReserve = params->prefetch_mshr_reserve;
+    prefetch::PrefetcherConfig pf_cfg;
+    pf_cfg.line_size = static_cast<uint32_t>(params->cache_line_size);
+    pf_cfg.degree = params->prefetch_degree;
+    core::PrefetchHost::Config host_cfg;
+    host_cfg.line_size = pf_cfg.line_size;
+    host_cfg.queue_capacity = params->prefetch_queue_capacity;
+    if (params->prefetcher_type.getValue() != "none") {
+        sparta_assert(mPfMshrReserve < params->mshr_capacity, params->prefetch_mshr_reserve.getLocation()
+                                                                  << " (" << mPfMshrReserve << ") must be below " << params->mshr_capacity.getLocation() << " ("
+                                                                  << params->mshr_capacity.getValue() << ") with a prefetcher");
+        sparta_assert(host_cfg.queue_capacity > 0, params->prefetch_queue_capacity.getLocation() << " must be nonzero with a prefetcher");
+        sparta_assert(pf_cfg.degree > 0, params->prefetch_degree.getLocation() << " must be nonzero with a prefetcher");
+        auto pf = prefetch::Registry<prefetch::InstructionPrefetcherInterface, prefetch::PrefetcherConfig>::instance().create(
+            params->prefetcher_type.getValue(), pf_cfg);
+        mPfHost = std::make_unique<core::PrefetchHost>(&unit_stat_set_, std::move(pf), host_cfg);
+    }
 
     // Read all cache parameters unconditionally
     mCacheInterfaceCfg.mshr_capacity = params->mshr_capacity;
@@ -32,6 +55,9 @@ FrontendMemoryStructures::FrontendMemoryStructures(sparta::TreeNode* node, const
     mCacheInterfaceCfg.cache.cacheSizeKb = params->cache_size_kb;
     mCacheInterfaceCfg.cache.lineSize = params->cache_line_size;
     mCacheInterfaceCfg.cache.associativity = params->cache_associativity;
+    mCacheInterfaceCfg.cache.sizeParam = params->cache_size_kb.getLocation();
+    mCacheInterfaceCfg.cache.lineSizeParam = params->cache_line_size.getLocation();
+    mCacheInterfaceCfg.cache.associativityParam = params->cache_associativity.getLocation();
     mCacheInterfaceCfg.cache.replacementPolicy = params->replacement_policy;
 
     if (mStructuralMode) {
@@ -39,8 +65,8 @@ FrontendMemoryStructures::FrontendMemoryStructures(sparta::TreeNode* node, const
     }
 
     request_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(FrontendMemoryStructures, receiveRequest, core::FetchRequest));
-    fill_response_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(FrontendMemoryStructures, receiveFillResponse, core::FillResponse));
-    invalidate_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(FrontendMemoryStructures, receiveInvalidate, core::InvalidateRequest));
+    fill_response_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(FrontendMemoryStructures, receiveFillResponse, mem::Response));
+    invalidate_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(FrontendMemoryStructures, receiveInvalidate, mem::Invalidate));
     flush_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(FrontendMemoryStructures, receiveFlush_, core::FlushRequest));
 }
 
@@ -49,20 +75,30 @@ void FrontendMemoryStructures::buildCacheInterface() {
     mCacheInterface = std::make_unique<cpu::CacheInterface>(mCacheInterfaceCfg, nullptr);
 
     if (mCacheInterfaceCfg.external_fill) {
-        mCacheInterface->setFillRequestCallback([this](cpu::address_t line_addr) {
-            core::FillRequest req;
+        mCacheInterface->setFillRequestCallback([this](cpu::address_t line_addr, bool /*write_allocate*/, bool prefetch) {
+            mem::Request req;
             req.line_addr = line_addr;
+            req.source = mem::CacheSource::ICACHE;
+            req.opcode = mem::ReqOpcode::ReadShared;  // instruction fetches are always reads
+            req.from_prefetch = prefetch;
             fill_request_out.send(req, 1);
         });
+    }
+
+    if (mPfHost) {
+        mPfHost->bind(mCacheInterface.get());
+        mCacheInterface->setEvictionCallback([this](cpu::address_t line_addr, bool) { mPfHost->onEviction(line_addr, getClock()->currentCycle()); });
+        mCacheInterface->setFillDoneCallback(
+            [this](cpu::address_t line_addr, bool prefetched) { mPfHost->onFill(line_addr, prefetched, getClock()->currentCycle()); });
     }
 
     // Re-attach tracer if one was set before the interface was rebuilt.
     if (mTracer) mCacheInterface->setTracer(mTracer);
 }
 
-void FrontendMemoryStructures::setL2(memory::L2Cache* l2) {
-    mL2 = l2;
-    if (mStructuralMode && l2) {
+void FrontendMemoryStructures::setUpstream(core::L1RequestAggregator* agg) {
+    mAgg = agg;
+    if (mStructuralMode && agg) {
         mCacheInterfaceCfg.external_fill = true;
         buildCacheInterface();
     }
@@ -78,21 +114,21 @@ size_t FrontendMemoryStructures::pendingPacketCount() const {
     return count;
 }
 
-bool FrontendMemoryStructures::canAcceptRequest(cpu::address_t addr) const {
-    // FetchQueue backpressure to Fetch: reject once queued + in-flight packets have
-    // claimed every FetchQueue entry. In-flight = packets inside the icache (accepted,
-    // not yet forwarded) plus packets sent this tick (1-cycle port flight). The
-    // structural forward gate in tick() is the hard overflow guard for the one fetch
-    // group this check cannot size in advance.
-    if (mFetchQueue) {
-        const size_t in_flight = pendingPacketCount() + mPacketsSentThisTick;
-        if (in_flight >= mFetchQueue->available()) return false;
-    }
+bool FrontendMemoryStructures::downstreamFull() const {
+    // In-flight = packets inside the icache (accepted, not yet forwarded) plus packets sent
+    // this tick (1-cycle port flight). The structural forward gate in tick() is the hard
+    // overflow guard for the one fetch group this check cannot size in advance.
+    const size_t in_flight = pendingPacketCount() + mPacketsSentThisTick;
+    if (mFetchQueue) return in_flight >= mFetchQueue->available();
+    if (mBypassDecode) return in_flight + mBypassDecode->numPendingPackets() >= mBypassCapacity;
+    return false;
+}
 
+bool FrontendMemoryStructures::canAcceptRequest(cpu::address_t addr) const {
     if (mStructuralMode) {
         if (!mCacheInterface->canAcceptRequest(addr)) return false;
         // If a new MSHR would be allocated, also check L2 has room for the fill.
-        if (mL2 && mCacheInterface->willNeedFill(addr) && !mL2->canAcceptIcacheRequest()) return false;
+        if (mAgg && mCacheInterface->willNeedFill(addr) && !mAgg->canAccept(mem::CacheSource::ICACHE)) return false;
         return true;
     }
     return mOutstandingMisses < mMshrCapacity;
@@ -136,13 +172,15 @@ void FrontendMemoryStructures::receiveRequest(const core::FetchRequest& request)
     mPendingRequests.push_back({request, latency, hit});
 }
 
-void FrontendMemoryStructures::receiveFillResponse(const core::FillResponse& resp) {
+void FrontendMemoryStructures::receiveFillResponse(const mem::Response& resp) {
     if (mCacheInterface) {
+        if (resp.granted_state == mem::LineState::I)
+            mCacheInterface->invalidateLine(resp.line_addr, getClock()->currentCycle());  // serve the waiters, keep nothing
         mCacheInterface->fillComplete(resp.line_addr, getClock()->currentCycle());
     }
 }
 
-void FrontendMemoryStructures::receiveInvalidate(const core::InvalidateRequest& req) {
+void FrontendMemoryStructures::receiveInvalidate(const mem::Invalidate& req) {
     if (mCacheInterface) {
         mCacheInterface->invalidateLine(req.line_addr, getClock()->currentCycle());
         ILOG("[icache] back-invalidate line=0x" << std::hex << req.line_addr);
@@ -172,16 +210,14 @@ void FrontendMemoryStructures::receiveFlush_(const core::FlushRequest& req) {
         size_t before = mPendingRequests.size();
         auto it = mPendingRequests.begin();
         while (it != mPendingRequests.end()) {
-            bool should_flush = false;
-            for (const auto& pkt : it->request.packets) {
-                if (core::shouldSquash(pkt, req)) {
-                    ILOG("[icache] cycle " << cycle << " SQUASHING tag=" << pkt.tag << " depth=" << (int)pkt.wrong_path_depth);
-                    if (mVis) mVis->onSquash(pkt.fetch_seq, cycle);
-                    should_flush = true;
-                    // Don't break - call onSquash for ALL packets in this request
-                }
-            }
-            if (should_flush) {
+            // A fetch group can hold the redirecting branch and older instructions: keep those.
+            std::erase_if(it->request.packets, [&](const core::PipelinePacket& pkt) {
+                if (!core::shouldSquash(pkt, req)) return false;
+                ILOG("[icache] cycle " << cycle << " SQUASHING tag=" << pkt.tag << " depth=" << (int)pkt.wrong_path_depth);
+                if (mVis) mVis->onSquash(pkt.fetch_seq, cycle);
+                return true;
+            });
+            if (it->request.packets.empty()) {
                 if (!it->hit) --mOutstandingMisses;
                 it = mPendingRequests.erase(it);
             } else {
@@ -199,14 +235,8 @@ void FrontendMemoryStructures::receiveFlush_(const core::FlushRequest& req) {
         // Check each fetch_seq's packets for squashing
         auto it = mStructuralPacketsBySeq.begin();
         while (it != mStructuralPacketsBySeq.end()) {
-            bool should_flush = false;
-            for (const auto& pkt : it->second) {
-                if (core::shouldSquash(pkt, req)) {
-                    should_flush = true;
-                    break;
-                }
-            }
-            if (should_flush) {
+            std::erase_if(it->second, [&req](const core::PipelinePacket& pkt) { return core::shouldSquash(pkt, req); });
+            if (it->second.empty()) {
                 // Remember this sequence was flushed
                 mFlushedSequences.insert(it->first);
                 ++cleared;
@@ -344,15 +374,30 @@ void FrontendMemoryStructures::tick() {
                 continue;
             }
 
+            // Fetch's canAcceptRequest() check does not reserve the MSHR, and a prefetch may
+            // have taken it since; wait for one rather than assert in loadRequest().
+            if (!mCacheInterface->canAcceptRequest(pend_req.token)) break;
+
             // Try to submit to cache
             uint64_t before = mCacheInterface->numCoalesced();
+            const auto probe = mPfHost ? mCacheInterface->probe(pend_req.token) : cpu::CacheInterface::Probe{};
             bool accepted = mCacheInterface->loadRequest(pend_req.token, pend_req.token, cycle);
             if (!accepted) {
                 // Bank conflict - stop trying this cycle, will retry next cycle
                 break;
             }
+            if (mPfHost) mPfHost->train(probe, pend_req.token, pend_req.token, /*is_store=*/false, prefetch::CacheLevel::L1I, cycle);
             if (mCacheInterface->numCoalesced() > before) ++mNumCoalesced;
             mStructuralPendingRequests.pop_front();
+        }
+
+        // Issue prefetches after demand fetches so they never starve demand traffic.
+        if (mPfHost) {
+            mPfHost->tick([this, cycle](cpu::address_t addr) {
+                if (mAgg && mCacheInterface->willNeedFill(addr) && !mAgg->canAccept(mem::CacheSource::ICACHE))
+                    return cpu::CacheInterface::PrefetchOutcome::NoMshr;
+                return mCacheInterface->prefetchRequest(addr, cycle, mPfMshrReserve);
+            });
         }
 
         // Drain completions from CacheInterface and process them

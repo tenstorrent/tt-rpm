@@ -60,7 +60,8 @@ std::string generateSnapshotFolderName(const std::string& traceFileName) {
 
     std::stringstream snapshotFolderSS;
     // Use position to extract prefix before "-s975-", then add "snap" + instruction count
-    snapshotFolderSS << trace_name.substr(0, s.position(0) + 1) << "snap" << snpShotInstr;
+    const std::string snap_prefix = trace_name.substr(0, s.position(0) + 1);
+    snapshotFolderSS << snap_prefix << "snap" << snpShotInstr;
 
     std::cout << "\n\t[Snapshot Util] token " << s[0] << " match at position " << s.position(0) << "\n\t\tSnapshot Index: " << snpShotIndx;
     std::cout << "\n\t[Snapshot Util] token " << i[0] << " match at position " << i.position(0) << "\n\t\tIntervl : " << intervlSubStr << " * " << multiplier
@@ -70,7 +71,7 @@ std::string generateSnapshotFolderName(const std::string& traceFileName) {
     snapshotFolder = file_path.parent_path().string() + "/" + snapshotFolderSS.str();
 
     // FIXME: eventually should converge the naming for snap folders
-    auto roi_snap_name = std::regex_replace(snapshotFolder, std::regex("snap"), "snap-roi0-");
+    auto roi_snap_name = file_path.parent_path().string() + "/" + snap_prefix + "snap-roi0-" + std::to_string(snpShotInstr);
     if (is_first_simpoint && !std::filesystem::exists(snapshotFolder) && !std::filesystem::exists(roi_snap_name)) return "";
 
     struct stat snapshotFolderStat = {};

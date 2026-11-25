@@ -5,8 +5,6 @@
 
 #include <iostream>
 
-#include "Common/BypassNetwork.hpp"
-#include "Common/SpeculationConfig.hpp"
 #include "Common/SpeculationUtils.hpp"
 #include "Common/WritebackBuffer.hpp"
 #include "LoadStoreUnit/LSQ/LSQ.hpp"
@@ -18,7 +16,11 @@ Execute::Execute(sparta::TreeNode* node, const ExecuteParams* params)
     : sparta::Unit(node),
       mNumExecuted(&unit_stat_set_, "num_executed", "Total instructions executed", sparta::Counter::COUNT_NORMAL),
       mNumSquashed(&unit_stat_set_, "num_squashed", "Instructions squashed due to flush", sparta::Counter::COUNT_NORMAL),
-      mNumMispredictions(&unit_stat_set_, "num_mispredictions", "Branch mispredictions detected", sparta::Counter::COUNT_NORMAL) {
+      mNumMispredictions(&unit_stat_set_, "num_mispredictions", "Branch mispredictions detected", sparta::Counter::COUNT_NORMAL),
+      mNumWritePortDenials(&unit_stat_set_, "num_write_port_denials", "Result-cycles held because every write port was taken, LSQ loads included",
+                           sparta::Counter::COUNT_NORMAL),
+      mNumWritePortConflictCycles(&unit_stat_set_, "num_write_port_conflict_cycles", "Cycles in which at least one result lost write-port arbitration",
+                                  sparta::Counter::COUNT_NORMAL) {
     in_port.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(Execute, receivePackets_, std::vector<core::IssuePacket>));
     flush_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(Execute, receiveFlush_, core::FlushRequest));
 
@@ -142,6 +144,7 @@ void Execute::receiveFlush_(const core::FlushRequest& req) {
     for (auto& group : mGroups) {
         total_squashed += group.squash([&req](const core::IssuePacket& pkt) { return core::shouldSquash(pkt.pkt, req); });
     }
+    if (mWritebackBuffer) total_squashed += mWritebackBuffer->squash(req);
 
     mNumSquashed += total_squashed;
     ILOG("[execute] Squashed " << total_squashed << " in-flight instructions");
@@ -161,13 +164,13 @@ void Execute::handleBranchMisprediction_(const InFlightUop& uop) {
     flush.branch_pc = pkt.pkt.pc;
     flush.branch_depth = pkt.pkt.wrong_path_depth;
     flush.predicted_taken = pkt.predicted_taken;
-    flush.was_taken = !pkt.predicted_taken;  // Actual outcome is opposite of prediction
+    flush.was_taken = pkt.target_mispredicted || !pkt.predicted_taken;  // A target mispredict was taken both ways
 
     // Target PC: depends on actual vs predicted direction
     // For predicted-taken-but-not-taken: fall-through (pc + size)
     // For predicted-not-taken-but-taken: use takenBranchTarget from trace
     const auto& rec = pkt.pkt.inst->getTraceRecord();
-    if (pkt.predicted_taken) {
+    if (pkt.predicted_taken && !pkt.target_mispredicted) {
         // Predicted taken but should have been not-taken: target is fall-through
         flush.target_pc = pkt.pkt.pc + pkt.pkt.size;
     } else {
@@ -183,17 +186,24 @@ void Execute::handleBranchMisprediction_(const InFlightUop& uop) {
     }
 
     ++mNumMispredictions;
+    mTickFlush = flush;
     mispred_flush_out.send(flush, 0);
 }
 
 void Execute::resolveBranch_(InFlightUop& uop, const char* log_prefix) {
+    // A branch denied a write port is revisited every cycle; resolving it again
+    // would re-send its misprediction flush or BranchResolved.
+    if (uop.resolved) return;
+    if (mTickFlush && core::shouldSquash(uop.pkt.pkt, *mTickFlush)) return;
+    uop.resolved = true;
+
     const auto& ipkt = uop.pkt;
 
     // Detect misprediction from Whisper trace: compare predicted vs actual
     const auto& rec = ipkt.pkt.inst->getTraceRecord();
     bool actual_taken = (rec.takenBranchTarget != 0);
     bool predicted_taken = ipkt.predicted_taken;
-    bool mispredicted = (actual_taken != predicted_taken);
+    bool mispredicted = (actual_taken != predicted_taken) || ipkt.target_mispredicted;
 
     ILOG(log_prefix << " cycle " << getClock()->currentCycle() << " branch tag=" << ipkt.pkt.tag << " depth=" << static_cast<int>(ipkt.pkt.wrong_path_depth)
                     << " predicted=" << predicted_taken << " actual=" << actual_taken << " mispredicted=" << mispredicted);
@@ -216,8 +226,9 @@ void Execute::resolveBranch_(InFlightUop& uop, const char* log_prefix) {
 
 void Execute::tick() {
     for (auto& g : mGroups) g.clearPending();
+    mTickFlush.reset();
 
-    bool any_work = false;
+    bool any_work = mWritebackBuffer && mWritebackBuffer->size() > 0;
     for (const auto& g : mGroups) {
         if (!g.queue.empty()) {
             any_work = true;
@@ -249,11 +260,11 @@ void Execute::tick() {
                 }
 
                 auto& ipkt = it->pkt;
-                bool is_memory = (ipkt.uop_type == core::UopType::Load || ipkt.uop_type == core::UopType::Store);
+                bool is_memory = (ipkt.uop_type == core::UopType::Load || ipkt.uop_type == core::UopType::Store || ipkt.uop_type == core::UopType::Fence);
                 bool is_branch = (ipkt.uop_type == core::UopType::Branch);
 
                 // Check for branch misprediction
-                if (is_branch && core::getSpeculationConfig().enabled) {
+                if (is_branch) {
                     resolveBranch_(*it, "[execute]");
                 }
 
@@ -263,9 +274,8 @@ void Execute::tick() {
                 if (!is_memory) {
                     for (const auto& dst : ipkt.phys_dsts) mCompletionsBuf.push_back(dst);
                     mRobCompletionsBuf.push_back(ipkt.rob_token);
-                    if (mBypassNetwork) mBypassNetwork->completeProducer(ipkt.pkt.tag);
                 } else {
-                    if (ipkt.uop_type == core::UopType::Store && !ipkt.phys_dsts.empty()) {
+                    if (ipkt.uop_type == core::UopType::Store && ipkt.pkt.inst_class != cpu::InstClass::Atomic && !ipkt.phys_dsts.empty()) {
                         for (const auto& dst : ipkt.phys_dsts) mCompletionsBuf.push_back(dst);
                     }
                     mMemOpsBuf.push_back(std::move(ipkt));
@@ -278,7 +288,7 @@ void Execute::tick() {
         }
 
         if (!mMemOpsBuf.empty()) mem_out.send(mMemOpsBuf, 1);
-        if (!mCompletionsBuf.empty()) completion_out.send(mCompletionsBuf, 1);
+        if (!mCompletionsBuf.empty() && completion_out.isBound()) completion_out.send(mCompletionsBuf, 1);
         if (!mRobCompletionsBuf.empty()) rob_complete_out.send(mRobCompletionsBuf, 1);
         return;
     }
@@ -309,18 +319,19 @@ void Execute::tick() {
 
             auto& ipkt = it->pkt;
             uint64_t saved_fetch_seq = ipkt.pkt.fetch_seq;  // Save before potential move
-            bool is_memory = (ipkt.uop_type == core::UopType::Load || ipkt.uop_type == core::UopType::Store);
+            bool is_memory = (ipkt.uop_type == core::UopType::Load || ipkt.uop_type == core::UopType::Store || ipkt.uop_type == core::UopType::Fence);
             bool is_branch = (ipkt.uop_type == core::UopType::Branch);
 
             // Check for branch misprediction (arbiter-enabled path)
-            if (is_branch && core::getSpeculationConfig().enabled) {
+            if (is_branch) {
                 resolveBranch_(*it, "[execute-arb]");
             }
 
             if (is_memory) {
                 // Stores with destinations (like auto-increment) need immediate register
                 // completion - they bypass the arbiter since this is just address computation.
-                if (ipkt.uop_type == core::UopType::Store && !ipkt.phys_dsts.empty()) {
+                // An atomic's destination is the memory value; the LSQ completes it.
+                if (ipkt.uop_type == core::UopType::Store && ipkt.pkt.inst_class != cpu::InstClass::Atomic && !ipkt.phys_dsts.empty()) {
                     for (const auto& dst : ipkt.phys_dsts) mStoreDestsBuf.push_back(dst);
                 }
                 if (mVis) mVis->onExeExit(saved_fetch_seq, getClock()->currentCycle());
@@ -332,7 +343,7 @@ void Execute::tick() {
                     // First time this instruction is ready for writeback
                     if (mWritebackBuffer) {
                         // Submit to writeback buffer
-                        if (mWritebackBuffer->accept(ipkt.pkt.tag, ipkt.pkt.fetch_seq, ipkt.phys_dsts, ipkt.rob_token, gi)) {
+                        if (mWritebackBuffer->accept(ipkt.pkt.tag, ipkt.pkt.fetch_seq, ipkt.pkt.wrong_path_depth, ipkt.phys_dsts, ipkt.rob_token, gi)) {
                             it->awaiting_write_port = true;
                             if (mVis) mVis->onExeExit(saved_fetch_seq, getClock()->currentCycle());
                             ++mNumExecuted;
@@ -376,12 +387,15 @@ void Execute::tick() {
 
     if (!mMemOpsBuf.empty()) mem_out.send(mMemOpsBuf, 1);
     // Store destinations bypass the arbiter - send them immediately
-    if (!mStoreDestsBuf.empty()) completion_out.send(mStoreDestsBuf, 1);
+    if (!mStoreDestsBuf.empty() && completion_out.isBound()) completion_out.send(mStoreDestsBuf, 1);
     // Completions for non-memory ops are sent in processWritePortGrants().
 }
 
 void Execute::processWritePortGrants() {
     if (!mArbiter || !mArbiter->enabled()) return;
+
+    mNumWritePortDenials += mArbiter->numDenied();
+    if (mArbiter->numDenied() > 0) ++mNumWritePortConflictCycles;
 
     mCompletionsBuf.clear();
     mRobCompletionsBuf.clear();
@@ -397,8 +411,6 @@ void Execute::processWritePortGrants() {
             if (mArbiter->isGranted(it->pkt.pkt.tag)) {
                 for (const auto& dst : it->pkt.phys_dsts) mCompletionsBuf.push_back(dst);
                 mRobCompletionsBuf.push_back(it->pkt.rob_token);
-                // Remove from bypass network (result now in PRF)
-                if (mBypassNetwork) mBypassNetwork->completeProducer(it->pkt.pkt.tag);
                 if (mVis) mVis->onExeExit(it->pkt.pkt.fetch_seq, getClock()->currentCycle());
                 ++mNumExecuted;
                 it = group.queue.erase(it);
@@ -411,19 +423,19 @@ void Execute::processWritePortGrants() {
 
     // Process grants for entries in writeback buffer
     if (mWritebackBuffer) {
-        auto ready = mWritebackBuffer->getReadyEntries();
-        for (auto* entry : ready) {
+        // Erasing from the deque's middle invalidates the remaining Entry pointers.
+        std::vector<uint64_t> granted;
+        for (auto* entry : mWritebackBuffer->getReadyEntries()) {
             if (mArbiter->isGranted(entry->tag)) {
                 for (const auto& dst : entry->phys_dsts) mCompletionsBuf.push_back(dst);
                 mRobCompletionsBuf.push_back(entry->rob_token);
-                // Remove from bypass network (result now in PRF)
-                if (mBypassNetwork) mBypassNetwork->completeProducer(entry->tag);
-                mWritebackBuffer->remove(entry->tag);
+                granted.push_back(entry->tag);
             }
         }
+        for (uint64_t tag : granted) mWritebackBuffer->remove(tag);
     }
 
-    if (!mCompletionsBuf.empty()) completion_out.send(mCompletionsBuf, 1);
+    if (!mCompletionsBuf.empty() && completion_out.isBound()) completion_out.send(mCompletionsBuf, 1);
     if (!mRobCompletionsBuf.empty()) rob_complete_out.send(mRobCompletionsBuf, 1);
 }
 

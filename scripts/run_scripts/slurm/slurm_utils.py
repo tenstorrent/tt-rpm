@@ -12,7 +12,7 @@ import re
 import shutil
 import subprocess
 import time
-from typing import Iterable, Optional
+from typing import Optional
 
 
 _JOB_ID_RE = re.compile(r"Submitted batch job\s+(\d+)")
@@ -45,28 +45,6 @@ def parse_job_id(sbatch_output: str) -> str:
     return m.group(1)
 
 
-def task_ids_to_slurm_spec(task_ids: Iterable[int]) -> str:
-    """Collapse a list of 1-based task ids into Slurm array-range notation.
-
-    E.g. [1,2,3,4,7,9,10,11] -> "1-4,7,9-11". Empty input returns "".
-    """
-    ids = sorted(set(int(t) for t in task_ids))
-    if not ids:
-        return ""
-    pieces: list[str] = []
-    run_start = ids[0]
-    prev = ids[0]
-    for tid in ids[1:]:
-        if tid == prev + 1:
-            prev = tid
-            continue
-        pieces.append(f"{run_start}" if run_start == prev else f"{run_start}-{prev}")
-        run_start = tid
-        prev = tid
-    pieces.append(f"{run_start}" if run_start == prev else f"{run_start}-{prev}")
-    return ",".join(pieces)
-
-
 def submit_sbatch(argv: list[str], *, dry_run: bool = False) -> str:
     """Run sbatch and return the parsed job id. argv should NOT start with 'sbatch'."""
     cmd = ["sbatch", *argv]
@@ -86,7 +64,9 @@ def submit_sbatch(argv: list[str], *, dry_run: bool = False) -> str:
 
 def job_still_queued(job_id: str, cluster: Optional[str] = None) -> bool:
     """True if `squeue` still knows about the job (pending or running)."""
-    cmd = ["squeue", "--states=all", "-h", "-j", str(job_id)]
+    # Finished jobs stay listed under --states=all until slurmctld purges them (MinJobAge).
+    cmd = ["squeue", "--states=PENDING,RUNNING,COMPLETING,CONFIGURING,SUSPENDED,REQUEUED,RESIZING",
+           "-h", "-j", str(job_id)]
     if cluster:
         cmd.extend(["--clusters", cluster])
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

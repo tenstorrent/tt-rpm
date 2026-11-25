@@ -17,18 +17,17 @@
 #include "sparta/statistics/Counter.hpp"
 
 #include "Common/PipelinePacket.hpp"
+#include "Common/PrefetchHost.hpp"
 #include "MemoryHierarchy/CacheInterface.hpp"
 
-namespace memory {
-class L2Cache;
-}
-
 namespace core {
+class L1RequestAggregator;
 class PipelineVisualizer;
-}
+}  // namespace core
 
 namespace frontend {
 
+class DecodeStructures;
 class FetchQueue;
 
 class FrontendMemoryStructuresParams : public sparta::ParameterSet {
@@ -36,16 +35,20 @@ class FrontendMemoryStructuresParams : public sparta::ParameterSet {
     FrontendMemoryStructuresParams(sparta::TreeNode* n)
         : sparta::ParameterSet(n) {}
 
-    PARAMETER(uint32_t, hit_latency, 1, "Icache hit latency in cycles")
+    PARAMETER(uint32_t, hit_latency, 2, "Icache hit latency in cycles")
     PARAMETER(uint32_t, miss_latency, 20, "Icache miss latency (no-L2 fallback)")
     PARAMETER(double, hit_rate, 1.0, "Icache hit rate (0.0-1.0)")
     PARAMETER(uint32_t, mshr_capacity, 4, "Max outstanding I-cache misses (MSHRs)")
     PARAMETER(std::string, cache_mode, "probabilistic", "Cache mode: probabilistic | structural")
-    PARAMETER(uint64_t, cache_size_kb, 64, "Structural cache size in KB")
+    PARAMETER(uint64_t, cache_size_kb, 32, "Structural cache size in KB")
     PARAMETER(uint64_t, cache_line_size, 64, "Structural cache line size in bytes")
     PARAMETER(uint64_t, cache_associativity, 8, "Structural cache associativity")
     PARAMETER(std::string, replacement_policy, "lru", "Replacement policy: lru | plru")
     PARAMETER(uint64_t, rng_seed, 0xCAFEULL, "Seed for the probabilistic-mode hit/miss RNG")
+    PARAMETER(std::string, prefetcher_type, "next_line", "Instruction prefetcher algorithm ('none' = disabled)")
+    PARAMETER(uint32_t, prefetch_degree, 2, "Lines requested per prefetch trigger")
+    PARAMETER(uint32_t, prefetch_queue_capacity, 8, "Prefetch queue entries; new prefetches are dropped when it is full")
+    PARAMETER(uint32_t, prefetch_mshr_reserve, 1, "MSHRs prefetches may not use, kept for demand misses")
 };
 
 class FrontendMemoryStructures : public sparta::Unit {
@@ -60,25 +63,30 @@ class FrontendMemoryStructures : public sparta::Unit {
     // Packets forwarded to FetchQueue after cache latency
     sparta::DataOutPort<std::vector<core::PipelinePacket>> packets_to_queue_out{&unit_port_set_, "packets_to_queue_out"};
 
-    // Fill ports — connected to L2Cache when L2 is enabled.
-    sparta::DataOutPort<core::FillRequest> fill_request_out{&unit_port_set_, "fill_request_out"};
-    sparta::DataInPort<core::FillResponse> fill_response_in{&unit_port_set_, "fill_response_in"};
+    // Fill ports — bound to the per-core L1RequestAggregator.
+    sparta::DataOutPort<mem::Request> fill_request_out{&unit_port_set_, "fill_request_out"};
+    sparta::DataInPort<mem::Response> fill_response_in{&unit_port_set_, "fill_response_in"};
 
     // Invalidate port — receives back-invalidation from inclusive L2.
-    sparta::DataInPort<core::InvalidateRequest> invalidate_in{&unit_port_set_, "invalidate_in"};
+    sparta::DataInPort<mem::Invalidate> invalidate_in{&unit_port_set_, "invalidate_in"};
 
     // Flush port — clears pending packets on misprediction recovery
     sparta::DataInPort<core::FlushRequest> flush_in{&unit_port_set_, "flush_in"};
 
     void tick();
 
-    // Attach the shared L2.  Must be called before the simulation starts.
-    // Re-initialises the structural CacheInterface with external_fill=true and
-    // wires the fill-request callback so misses are forwarded to the L2.
-    void setL2(memory::L2Cache* l2);
+    // Connect this L1 to the per-core L1RequestAggregator (the next level below it).
+    // Enables external fill (misses forwarded over fill_request_out) and routes
+    // backpressure through the aggregator. Requires structural cache_mode.
+    void setUpstream(core::L1RequestAggregator* agg);
 
     // Attach the FetchQueue for backpressure checking
     void setFetchQueue(frontend::FetchQueue* fq) { mFetchQueue = fq; }
+    // bypass_queues: Decode's input buffer stands in for the FetchQueue, with the same capacity.
+    void setBypassDecode(const frontend::DecodeStructures* d, size_t capacity) {
+        mBypassDecode = d;
+        mBypassCapacity = capacity;
+    }
 
     // Attach a PipelineVisualizer for debug output
     void setVisualizer(core::PipelineVisualizer* v) { mVis = v; }
@@ -93,10 +101,13 @@ class FrontendMemoryStructures : public sparta::Unit {
     // addr: the base PC of the next fetch — used for coalescing check in
     // structural mode; ignored (capacity-only check) in probabilistic mode.
     bool canAcceptRequest(cpu::address_t addr) const;
+    // Queued plus in-flight packets have claimed every FetchQueue (or bypass Decode buffer) entry.
+    bool downstreamFull() const;
 
     uint64_t numHits() const { return mNumHits.get(); }
     uint64_t numMisses() const { return mNumMisses.get(); }
     uint64_t numCoalesced() const { return mNumCoalesced.get(); }
+    const core::PrefetchHost* prefetchHost() const { return mPfHost.get(); }
 
    private:
     // Probabilistic-mode pending queue (structural mode uses CacheInterface).
@@ -108,8 +119,8 @@ class FrontendMemoryStructures : public sparta::Unit {
 
     void buildCacheInterface();
     void receiveRequest(const core::FetchRequest& request);
-    void receiveFillResponse(const core::FillResponse& resp);
-    void receiveInvalidate(const core::InvalidateRequest& req);
+    void receiveFillResponse(const mem::Response& resp);
+    void receiveInvalidate(const mem::Invalidate& req);
     void receiveFlush_(const core::FlushRequest& req);
     void sendResponseProb();
     bool canForwardPackets(const core::FetchRequest& req) const;
@@ -133,10 +144,16 @@ class FrontendMemoryStructures : public sparta::Unit {
     bool mStructuralMode{false};
     cpu::CacheInterface::Config mCacheInterfaceCfg;        // saved for re-init
     std::unique_ptr<cpu::CacheInterface> mCacheInterface;  // structural mode
+
+    // Instruction prefetcher (null when disabled).
+    std::unique_ptr<core::PrefetchHost> mPfHost;
+    uint32_t mPfMshrReserve{0};
     cpu::CacheTracer* mTracer{nullptr};
 
-    memory::L2Cache* mL2{nullptr};
+    core::L1RequestAggregator* mAgg{nullptr};
     frontend::FetchQueue* mFetchQueue{nullptr};
+    const frontend::DecodeStructures* mBypassDecode{nullptr};
+    size_t mBypassCapacity{0};
     core::PipelineVisualizer* mVis{nullptr};
 
     // Structural mode: packets indexed by fetch_seq (unique, never overwrites)

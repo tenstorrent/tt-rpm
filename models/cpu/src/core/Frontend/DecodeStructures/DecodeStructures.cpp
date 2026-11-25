@@ -3,6 +3,9 @@
 
 #include "Frontend/DecodeStructures/DecodeStructures.hpp"
 
+#include <algorithm>
+
+#include "Common/FpOpClass.hpp"
 #include "Common/SpeculationUtils.hpp"
 #include "Frontend/DecodeQueue/DecodeQueue.hpp"
 #include "Frontend/FetchQueue/FetchQueue.hpp"
@@ -13,10 +16,15 @@ namespace frontend {
 
 DecodeStructures::DecodeStructures(sparta::TreeNode* node, const DecodeStructuresParams* params)
     : sparta::Unit(node),
-      mMispredPenalty(params->bp_mispred_penalty),
+      mLatFpDivS(static_cast<uint8_t>(params->lat_fp_div_s)),
+      mLatFpDivD(static_cast<uint8_t>(params->lat_fp_div_d)),
+      mDecodeWidth(params->decode_width),
       mNumDecoded(&unit_stat_set_, "num_decoded", "Total instructions decoded", sparta::Counter::COUNT_NORMAL),
-      mNumMispredStallCycles(&unit_stat_set_, "num_mispred_stall_cycles", "Cycles stalled due to branch misprediction", sparta::Counter::COUNT_NORMAL),
-      mNumBranchWaitCycles(&unit_stat_set_, "num_branch_wait_cycles", "Cycles waiting for branch prediction", sparta::Counter::COUNT_NORMAL) {
+      mNumBranchWaitCycles(&unit_stat_set_, "num_branch_wait_cycles", "Cycles waiting for branch prediction", sparta::Counter::COUNT_NORMAL),
+      mNumMisfetchRedirects(&unit_stat_set_, "num_misfetch_redirects", "Fetch redirects raised at Decode, wrong path included", sparta::Counter::COUNT_NORMAL),
+      mNumWidthLimitedCycles(&unit_stat_set_, "num_width_limited_cycles", "Cycles Decode stopped at decode_width with more instructions ready",
+                             sparta::Counter::COUNT_NORMAL) {
+    sparta_assert(mDecodeWidth > 0, params->decode_width.getLocation() << " must be at least 1");
     flush_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(DecodeStructures, receiveFlush_, core::FlushRequest));
     packets_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(DecodeStructures, receivePackets_, std::vector<core::PipelinePacket>));
     branch_predict_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(DecodeStructures, receiveBranchPrediction_, core::BranchPrediction));
@@ -30,6 +38,14 @@ DecodeStructures::DecodeStructures(sparta::TreeNode* node, const DecodeStructure
     mLatencyTable[static_cast<size_t>(core::UopType::FpOp)] = static_cast<uint8_t>(params->lat_fp);
     mLatencyTable[static_cast<size_t>(core::UopType::VecOp)] = static_cast<uint8_t>(params->lat_vec);
     mLatencyTable[static_cast<size_t>(core::UopType::Fence)] = static_cast<uint8_t>(params->lat_fence);
+
+    mFpLatency[static_cast<size_t>(core::FpOpClass::Other)] = static_cast<uint8_t>(params->lat_fp);
+    mFpLatency[static_cast<size_t>(core::FpOpClass::Add)] = static_cast<uint8_t>(params->lat_fp_add);
+    mFpLatency[static_cast<size_t>(core::FpOpClass::Mul)] = static_cast<uint8_t>(params->lat_fp_mul);
+    mFpLatency[static_cast<size_t>(core::FpOpClass::Fma)] = static_cast<uint8_t>(params->lat_fp_fma);
+    mFpLatency[static_cast<size_t>(core::FpOpClass::Move)] = static_cast<uint8_t>(params->lat_fp_move);
+    mFpLatency[static_cast<size_t>(core::FpOpClass::Compare)] = static_cast<uint8_t>(params->lat_fp_cmp);
+    mFpLatency[static_cast<size_t>(core::FpOpClass::Convert)] = static_cast<uint8_t>(params->lat_fp_cvt);
 }
 
 void DecodeStructures::receiveFlush_(const core::FlushRequest& req) {
@@ -104,10 +120,15 @@ void DecodeStructures::receivePackets_(const std::vector<core::PipelinePacket>& 
     ILOG("[decode] received " << pkts.size() << " packets directly, pending=" << mPendingPackets.size());
 }
 
-core::UopType DecodeStructures::classifyUop(cpu::InstClass ic) {
-    switch (ic) {
-        case cpu::InstClass::ALU:
+core::UopType DecodeStructures::classifyUop(const core::PipelinePacket& pkt) {
+    switch (pkt.inst_class) {
+        case cpu::InstClass::ALU: {
+            // fence.i and sfence.vma also order memory: their stores must be visible first.
+            if (!pkt.inst) return core::UopType::ALU;
+            const std::string& asm_text = pkt.inst->getTraceRecord().assembly;
+            if (asm_text.starts_with("fence") || asm_text.starts_with("sfence.vma")) return core::UopType::Fence;
             return core::UopType::ALU;
+        }
         case cpu::InstClass::Multiply:
             return core::UopType::Mul;
         case cpu::InstClass::Divide:
@@ -130,19 +151,46 @@ core::UopType DecodeStructures::classifyUop(cpu::InstClass ic) {
     return core::UopType::ALU;
 }
 
+uint8_t DecodeStructures::latencyFor_(const core::PipelinePacket& pkt, core::UopType t) const {
+    switch (pkt.inst->getFpDivPrecision()) {
+        case cpu::FpDivPrecision::Single:
+            return mLatFpDivS;
+        case cpu::FpDivPrecision::Double:
+            return mLatFpDivD;
+        case cpu::FpDivPrecision::None:
+            break;
+    }
+    if (t == core::UopType::FpOp) return mFpLatency[static_cast<size_t>(core::fpOpClass(pkt.inst->getTraceRecord().inst))];
+    return mLatencyTable[static_cast<size_t>(t)];
+}
+
+// Decode found a branch the fetch path got wrong but Decode's prediction got right (a BTB miss
+// on a taken direct branch, or a wrong BTB target it can compute). Returns true if fetch is redirected.
+bool DecodeStructures::redirectMisfetch_(const core::BranchPrediction& pred, core::DecodePacket& dp) {
+    dp.target_mispredicted = pred.target_mispredicted;
+    dp.direct_jump = pred.type == predictors::BranchType::DirectJump || pred.type == predictors::BranchType::Call;
+    if (!pred.misfetch) return false;
+    ++mNumMisfetchRedirects;
+    // A full recovery: Decode's path is the correct one, so this resolves the branch's speculation.
+    core::FlushRequest flush;
+    flush.source = core::FlushSource::Execute;
+    flush.branch_tag = dp.pkt.tag;
+    flush.branch_fetch_seq = dp.pkt.fetch_seq;
+    flush.branch_pc = dp.pkt.pc;
+    flush.branch_depth = dp.pkt.wrong_path_depth;
+    flush.predicted_taken = pred.predicted_taken;
+    flush.was_taken = pred.predicted_taken;
+    flush.target_pc = pred.predicted_taken ? pred.target_pc : dp.pkt.pc + dp.pkt.size;
+    misfetch_flush_out.send(flush, 0);
+    ILOG("[decode] cycle " << getClock()->currentCycle() << " MISFETCH tag=" << dp.pkt.tag << " pc=0x" << std::hex << dp.pkt.pc << " redirect=0x"
+                           << flush.target_pc << std::dec);
+    return true;
+}
+
 void DecodeStructures::tick() {
     uint64_t cycle = getClock()->currentCycle();
 
     ILOG("[decode] cycle " << cycle << " pending_pkts=" << mPendingPackets.size() << " pending_preds=" << mPendingPredictions.size());
-
-    // Handle misprediction stall
-    if (mMispredStall > 0) {
-        ILOG("[decode] mispred stall, " << mMispredStall << " cycle(s) remaining");
-        --mMispredStall;
-        ++mNumMispredStallCycles;
-        mRestartAfterMispredStall = true;
-        return;
-    }
 
     // Check downstream capacity
     size_t downstream_space = 32;
@@ -156,8 +204,11 @@ void DecodeStructures::tick() {
         ILOG("[decode] stalled: downstream full");
         return;
     }
+    const bool width_limited = downstream_space > mDecodeWidth;
+    downstream_space = std::min<size_t>(downstream_space, mDecodeWidth);
 
     mDecodePacketsBuf.clear();
+    bool redirected = false;
 
     if (mDirectMode) {
         // Direct mode: process packets from mPendingPackets buffer
@@ -184,8 +235,8 @@ void DecodeStructures::tick() {
 
             core::DecodePacket dp;
             dp.pkt = pkt_copy;
-            dp.uop_type = classifyUop(pkt_copy.inst_class);
-            dp.latency = mLatencyTable[static_cast<size_t>(dp.uop_type)];
+            dp.uop_type = classifyUop(pkt_copy);
+            dp.latency = latencyFor_(pkt_copy, dp.uop_type);
 
             // Look up prediction for branches (guaranteed to exist now, keyed by fetch_seq)
             if (is_branch) {
@@ -195,13 +246,7 @@ void DecodeStructures::tick() {
                 ILOG("[decode] cycle " << getClock()->currentCycle() << " fetch_seq=" << pkt_copy.fetch_seq << " (tag=" << pkt_copy.tag
                                        << ") merged prediction: predicted_taken=" << dp.predicted_taken << " was_mispredicted=" << dp.was_mispredicted);
 
-                // Apply misprediction penalty (stall decode for N cycles)
-                if (pred_it->second.mispredicted && mMispredPenalty > 0) {
-                    mMispredStall = mMispredPenalty;
-                    if (mVis) mVis->onBranchMispredict(pkt_copy.fetch_seq, cycle);
-                    ILOG("[decode] direct mode: misprediction at pc=0x" << std::hex << pkt_copy.pc << std::dec << " stalling for " << mMispredPenalty
-                                                                        << " cycles");
-                }
+                redirected = redirectMisfetch_(pred_it->second, dp);
 
                 mPendingPredictions.erase(pred_it);  // Consumed
             } else {
@@ -209,15 +254,14 @@ void DecodeStructures::tick() {
                 dp.was_mispredicted = false;
             }
 
-            dp.after_mispredict_stall = mRestartAfterMispredStall;
-            mRestartAfterMispredStall = false;
             mDecodePacketsBuf.push_back(dp);
+            if (redirected) break;  // younger packets are on the misfetched path
         }
     } else {
         // Pull model from FetchQueue
         if (!mFetchQueue) return;
 
-        while (!mFetchQueue->isEmpty() && mDecodePacketsBuf.size() < downstream_space) {
+        while (mFetchQueue->hasReady() && mDecodePacketsBuf.size() < downstream_space) {
             const auto* peek_entry = mFetchQueue->peek();
             if (!peek_entry) break;
 
@@ -233,26 +277,24 @@ void DecodeStructures::tick() {
 
             core::DecodePacket dp;
             dp.pkt = entry.pkt;
-            dp.uop_type = classifyUop(entry.pkt.inst_class);
-            dp.latency = mLatencyTable[static_cast<size_t>(dp.uop_type)];
+            dp.uop_type = classifyUop(entry.pkt);
+            dp.latency = latencyFor_(entry.pkt, dp.uop_type);
 
             // Copy branch prediction info
             if (entry.has_branch_prediction) {
                 dp.predicted_taken = entry.branch_pred.predicted_taken;
                 dp.was_mispredicted = entry.branch_pred.mispredicted;
 
-                // Handle misprediction penalty
-                if (entry.branch_pred.mispredicted) {
-                    mMispredStall = mMispredPenalty;
-                    if (mVis) mVis->onBranchMispredict(entry.pkt.fetch_seq, getClock()->currentCycle());
-                    ILOG("[decode] misprediction at pc=0x" << std::hex << entry.pkt.pc << std::dec << " stalling for " << mMispredPenalty << " cycles");
-                }
+                redirected = redirectMisfetch_(entry.branch_pred, dp);
             }
 
-            dp.after_mispredict_stall = mRestartAfterMispredStall;
-            mRestartAfterMispredStall = false;
             mDecodePacketsBuf.push_back(dp);
+            if (redirected) break;  // younger packets are on the misfetched path
         }
+    }
+
+    if (width_limited && mDecodePacketsBuf.size() == mDecodeWidth && !redirected && (mDirectMode ? !mPendingPackets.empty() : mFetchQueue->hasReady())) {
+        ++mNumWidthLimitedCycles;
     }
 
     if (!mDecodePacketsBuf.empty()) {

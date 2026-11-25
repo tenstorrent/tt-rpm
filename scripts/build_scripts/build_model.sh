@@ -24,6 +24,18 @@ BUILD_ALL=0
 declare -A MODEL_PATHS=(
     [simple]="models/cpu/src/simple"
     [core]="models/cpu/src/core"
+    [cluster]="."
+)
+
+# Per-model overrides for models that don't follow the "one src dir -> build/<name>,
+# build everything" convention. The cluster is built from the top-level CMakeLists
+# (source = repo root) into build/top, and we only want its `cluster` target plus the
+# accelerator test harnesses that run_smoke.sh executes.
+declare -A MODEL_BUILD_DIR=(
+    [cluster]="top"
+)
+declare -A MODEL_TARGET=(
+    [cluster]="cluster accel_fabric_test accel_dma_test"
 )
 
 usage() {
@@ -32,7 +44,7 @@ usage() {
     echo "Build an RPM simulation model."
     echo ""
     echo "Options:"
-    echo "  -m, --model NAME      Model to build: simple, core"
+    echo "  -m, --model NAME      Model to build: simple, core, cluster"
     echo "  -a, --all             Build all available models"
     echo "  -j, --jobs N          Parallel build jobs (default: $JOBS)"
     echo "  -c, --clean           Clean build directory before building"
@@ -41,9 +53,10 @@ usage() {
     echo ""
     echo "Examples:"
     echo "  $(basename "$0") --model core"
+    echo "  $(basename "$0") --model cluster"
     echo "  $(basename "$0") --all --jobs 8"
     echo "  $(basename "$0") --model core --clean --type Debug"
-    exit 0
+    exit "${1:-0}"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -54,20 +67,22 @@ while [[ $# -gt 0 ]]; do
         -c|--clean) CLEAN=1; shift ;;
         -t|--type)  BUILD_TYPE="$2"; shift 2 ;;
         -h|--help)  usage ;;
-        *) echo "Unknown option: $1"; usage ;;
+        *) echo "Unknown option: $1"; usage 1 ;;
     esac
 done
 
 if [ "$BUILD_ALL" -eq 0 ] && [ -z "$MODEL" ]; then
     echo "Error: specify --model NAME or --all"
-    usage
+    usage 1
 fi
 
 build_model() {
     local name="$1"
     local src_rel="${MODEL_PATHS[$name]}"
     local src_dir="$RPM_ROOT/$src_rel"
-    local build_dir="$RPM_ROOT/build/$name"
+    local build_name="${MODEL_BUILD_DIR[$name]:-$name}"
+    local build_dir="$RPM_ROOT/build/$build_name"
+    local target="${MODEL_TARGET[$name]:-}"
 
     if [ ! -f "$src_dir/CMakeLists.txt" ]; then
         echo "  WARNING: No CMakeLists.txt found at $src_dir — skipping $name"
@@ -76,7 +91,7 @@ build_model() {
 
     echo "--- Building: $name ---"
     echo "  Source:  $src_rel"
-    echo "  Build:   build/$name"
+    echo "  Build:   build/$build_name"
 
     if [ "$CLEAN" -eq 1 ] && [ -d "$build_dir" ]; then
         echo "  Cleaning build directory..."
@@ -85,11 +100,16 @@ build_model() {
 
     mkdir -p "$build_dir"
     cmake -S "$src_dir" -B "$build_dir" -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
-    cmake --build "$build_dir" -j "$JOBS"
+    if [ -n "$target" ]; then
+        cmake --build "$build_dir" --target $target -j "$JOBS"  # unquoted: may list several targets
+    else
+        cmake --build "$build_dir" -j "$JOBS"
+    fi
 
-    # Symlink config.yaml so the binary always reads the source copy
+    # Symlink config.yaml so the binary always reads the source copy; relative, so it
+    # survives the repo being mounted elsewhere (e.g. built in Docker at /workspace).
     if [ -f "$src_dir/config.yaml" ]; then
-        ln -sf "$src_dir/config.yaml" "$build_dir/config.yaml"
+        ln -sfr "$src_dir/config.yaml" "$build_dir/config.yaml"
         echo "  Linked config.yaml -> $src_rel/config.yaml"
     fi
 

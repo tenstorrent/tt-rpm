@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <iostream>
+#include <span>
 #include <sstream>
 
 #include "DecodedInst.hpp"
@@ -26,6 +28,8 @@ constexpr uint64_t PAGE_SIZE_4KB_BYTES = 4096;
 inline uint64_t get_page(uint64_t addr) { return addr / PAGE_SIZE_4KB_BYTES; }
 inline uint64_t get_page_offset(uint64_t addr) { return addr & (PAGE_SIZE_4KB_BYTES - 1); }
 enum CSRLabel : unsigned { vstart_c = 0, vl_c = 1, vtype_c = 2, vlen_c = 3 };
+// Whisper's ROI-exit HINT is `addi x0, x12, imm` (any imm); x11 marks ROI entry instead.
+inline bool isRegionEndMarker(const WdRiscv::DecodedInst &di) { return di.instId() == WdRiscv::InstId::addi && di.op0() == 0 && di.op1() == 12; }
 }  // namespace
 #ifndef SPARTA_ASSERT_CLK
 #define SPARTA_ASSERT_CLK(cond, msg) sparta_assert(cond, msg)
@@ -45,7 +49,8 @@ ExecutionDriver::ExecutionDriver(sparta::TreeNode *node, const ExecutionDriverPa
       mWhisperFlags(p->whisper_flags),
       mAllowEarlyTermination(p->allow_early_termination),
       mEnableSnapshot(p->enable_snapshot_usage),
-      mLogEnabled(p->log_enabled),
+      mSharedHartCount(p->shared_hart_count),
+      mPrivateSystem(p->private_system),
       mHartIx(0),
       mSnapshotFolderName(p->snapshot_foldername),
       mInstsFetched(&unit_stat_set_, "instructions_fetched", "total instructions fetched", sparta::Counter::COUNT_NORMAL),
@@ -54,7 +59,7 @@ ExecutionDriver::ExecutionDriver(sparta::TreeNode *node, const ExecutionDriverPa
 }
 
 ExecutionDriver::~ExecutionDriver() {
-    if (mId == 0 && mSetupDone) {
+    if (mOwnsSystem) {
         mSession.cleanup(mArgs);
     }
 
@@ -67,19 +72,20 @@ bool ExecutionDriver::doSetupHelper(coreid_t id, const std::string &snapshotFold
     const auto start_time = std::chrono::system_clock::now();
     mId = id;
 
-    if (mId > 0) {
-        ILOG("[doSetupHelper] Setting up core " << mId << " by mapping to core 0");
+    if (!mPrivateSystem && mId > 0) {
+        ILOG("[doSetupHelper] Core " << mId << " attaching to the Whisper system built by core 0");
         auto it = mCoreIdToPerfApiMap.find(0);
-        if (it != mCoreIdToPerfApiMap.end()) {
-            mPerfApiHandle = it->second.first;
-            mHartPtr = it->second.second;
-            sparta_assert(mPerfApiHandle && mHartPtr, "[Execution Driver] doSetup() mPerfApiHandle or mHartPtr is nullptr for core " << mId);
-            mSetupDone = true;
-        } else {
-            sparta_assert(false, "[doSetupHelper] core 0 not found in map -- please check setup order");
-        }
+        sparta_assert(it != mCoreIdToPerfApiMap.end() && it->second.first, "[doSetupHelper] core " << mId << " set up before core 0 built the shared system");
+        mPerfApiHandle = it->second.first;
+        mHartPtr = mPerfApiHandle->getHart(mId);
+        // A system built with fewer harts has none for this core: share core 0's.
+        if (!mHartPtr) mHartPtr = it->second.second;
+        sparta_assert(mHartPtr, "[doSetupHelper] core " << mId << " has no hart to bind (system expected to have " << mSharedHartCount << " harts)");
+        mHartIx = mHartPtr->sysHartIndex();
+        mNextPc = mHartPtr->peekPc();
+        mSetupDone = true;
     } else {
-        ILOG("[doSetupHelper] Starting setup for core 0");
+        ILOG("[doSetupHelper] Core " << mId << " building its Whisper system");
 
         if (!snapshotFolderName.empty()) {
             mSnapshotFolderName = snapshotFolderName;
@@ -88,7 +94,10 @@ bool ExecutionDriver::doSetupHelper(coreid_t id, const std::string &snapshotFold
 
         auto wargv = buildWhisperArguments();
         initializeWhisperSystem(wargv);
+        mOwnsSystem = true;
     }
+    // RV64 PAs are at most 56 bits, so the tag never aliases a real address or changes set indexing.
+    if (mPrivateSystem) mPaTag = (static_cast<uint64_t>(mId) + 1) << 56;
 
     mCoreIdToPerfApiMap[id] = std::make_pair(mPerfApiHandle, mHartPtr);
 
@@ -103,6 +112,9 @@ std::vector<std::string> ExecutionDriver::buildWhisperArguments() {
     std::vector<std::string> wargv = {"whisper", "--perfapi", "-v"};
 
     const std::unordered_set<std::string> whisperFlagsSet(mWhisperFlags.begin(), mWhisperFlags.end());
+    // Without --reproducibleseed, SEED CSR reads return host entropy; a full-system guest seeds
+    // its RNG (and so ASLR) from them, so repeated runs place the workload differently.
+    if (!whisperFlagsSet.contains("--reproducibleseed")) wargv.emplace_back("--reproducibleseed");
     bool config_present = whisperFlagsSet.contains("--configfile") || whisperFlagsSet.contains("--config");
     std::string whisperConfigPath;
     if (!config_present) {
@@ -123,6 +135,13 @@ std::vector<std::string> ExecutionDriver::buildWhisperArguments() {
         wargv.emplace_back(whisperConfigPath);
     }
 
+    const bool userHarts = std::ranges::any_of(mWhisperFlags, [](const std::string &f) { return f == "--harts" || f.starts_with("--harts="); });
+    if (!mPrivateSystem && mSharedHartCount > 1 && !userHarts) {
+        wargv.emplace_back("--harts");
+        wargv.emplace_back(std::to_string(mSharedHartCount));
+        std::cout << "Execution Driver: building a shared Whisper system with " << mSharedHartCount << " harts" << '\n';
+    }
+
     for (size_t i = 0; i < mWhisperFlags.size(); ++i) {
         if (mWhisperFlags[i] == "--xlen" && i + 1 < mWhisperFlags.size()) {
             wargv.emplace_back("--xlen");
@@ -131,14 +150,20 @@ std::vector<std::string> ExecutionDriver::buildWhisperArguments() {
         }
     }
 
-    wargv.emplace_back("--target");
+    // Resolve the --target program. With an explicit ELF, use it. Otherwise look for
+    // the default firmware ELF next to the snapshot (some snapshots ship one);
+    // if there isn't one, omit --target entirely and let --loadfrom supply the program
+    // (full-system snapshots restore memory + PC, so no target ELF is needed).
+    std::string targetPath;
     if (!mTargetCommand.empty()) {
-        wargv.emplace_back(mTargetCommand);
-    } else {
-        auto whisperPath = generateWhisperPath(mSnapshotFolderName);
-        auto whisperElfPath = whisperPath + "/" + mDefaultWhisperElfName;
-        sparta_assert(std::filesystem::exists(whisperElfPath), "[ExecutionDriver] doSetup() Could not find executable at " << whisperElfPath);
-        wargv.emplace_back(whisperElfPath);
+        targetPath = mTargetCommand;
+    } else if (!mSnapshotFolderName.empty()) {
+        auto whisperElfPath = generateWhisperPath(mSnapshotFolderName) + "/" + mDefaultWhisperElfName;
+        if (std::filesystem::exists(whisperElfPath)) targetPath = whisperElfPath;
+    }
+    if (!targetPath.empty()) {
+        wargv.emplace_back("--target");
+        wargv.emplace_back(targetPath);
     }
 
     for (size_t i = 0; i < mWhisperFlags.size(); ++i) {
@@ -193,8 +218,9 @@ void ExecutionDriver::initializeWhisperSystem(std::vector<std::string> &wargv) {
     mPerfApiHandle = system->getPerfApi();
     sparta_assert(mPerfApiHandle, "got invalid perfApi handler");
 
-    ILOG("[initializeWhisperSystem] Getting Hart " << mId << " from PerfApi");
-    mHartPtr = mPerfApiHandle->getHart(mId);
+    const unsigned hart = mPrivateSystem ? 0 : mId;
+    ILOG("[initializeWhisperSystem] Getting Hart " << hart << " from PerfApi");
+    mHartPtr = mPerfApiHandle->getHart(hart);
     sparta_assert(mHartPtr, "whisper mHartPtr should not be nullptr");
 
     mHartIx = mHartPtr->sysHartIndex();
@@ -224,7 +250,75 @@ bool ExecutionDriver::isFinished() {
     if (isProgramFinished) {
         ILOG("[isFinished] Program has finished execution on whisper hart");
     }
-    return mFinishedOverride || isProgramFinished;
+    return mProgramEnded || mFinishedOverride || isProgramFinished;
+}
+
+//==================== Data-carrying shadow: Whisper peek ====================
+
+void ExecutionDriver::peekPhysBytes(uint64_t addr, uint8_t *buf, uint32_t len, bool translate) const {
+    if (!mHartPtr) {
+        std::fill(buf, buf + len, uint8_t{0});
+        return;
+    }
+    // Callers pass a VIRTUAL address when `translate` (the cache is virtually addressed).
+    // Translate to physical exactly as the load path does (mirrors PerfApi::translateLoadAddr)
+    // before reading Whisper; a raw peek of the untranslated VA would read the wrong physical
+    // location. Best-effort: on translation failure, zero-fill (this is a side-effect-free
+    // shadow read, never architectural). Loose-coupling descriptors carry physical addresses
+    // (translate=false).
+    uint64_t pa = addr;
+    auto pm = mHartPtr->privilegeMode();
+    if (translate && pm != WdRiscv::PrivilegeMode::Machine && mHartPtr->isRvs()) {
+        mHartPtr->clearPageTableWalk();
+        bool r = true, w = false, x = false;
+        if (mHartPtr->transAddrNoUpdate(addr, pm, mHartPtr->virtMode(), r, w, x, pa) != WdRiscv::ExceptionCause::NONE) {
+            std::fill(buf, buf + len, uint8_t{0});
+            return;
+        }
+    }
+    // Byte-wise physical read (usePma=true honors the memory map; side-effect-free peek).
+    for (uint32_t i = 0; i < len; ++i) {
+        uint8_t v = 0;
+        mHartPtr->peekMemory(pa + i, v, /*usePma=*/true);
+        buf[i] = v;
+    }
+}
+
+//==================== Data-carrying shadow: Whisper poke ====================
+
+bool ExecutionDriver::pokePhysBytes(uint64_t addr, const uint8_t *buf, uint32_t len, bool translate) {
+    if (!mHartPtr) {
+        return false;
+    }
+    // Mirror peekPhysBytes: callers pass a VIRTUAL address when `translate` (the accelerator's
+    // tight-coupling path); translate to physical exactly as the store path would (w
+    // permission). Loose-coupling descriptors carry physical addresses (translate=false).
+    uint64_t pa = addr;
+    if (translate) {
+        auto pm = mHartPtr->privilegeMode();
+        if (pm != WdRiscv::PrivilegeMode::Machine && mHartPtr->isRvs()) {
+            mHartPtr->clearPageTableWalk();
+            bool r = false, w = true, x = false;
+            if (mHartPtr->transAddrNoUpdate(addr, pm, mHartPtr->virtMode(), r, w, x, pa) != WdRiscv::ExceptionCause::NONE) {
+                ++mPokeFailures;
+                std::cerr << "[edriver] pokePhysBytes: VA translation failed addr=0x" << std::hex << addr << "\n";
+                sparta_assert(false, "pokePhysBytes VA translation failed addr=0x" << std::hex << addr);
+                return false;
+            }
+        }
+    }
+    // Byte-wise physical write. Hart::pokeMemory fails only when the PMA says not-writable
+    // (usePma=true); SparseMem::write creates the destination page on first touch, so an
+    // unmapped-but-legal address succeeds.
+    for (uint32_t i = 0; i < len; ++i) {
+        if (!mHartPtr->pokeMemory(pa + i, buf[i], /*usePma=*/true)) {
+            ++mPokeFailures;
+            std::cerr << "[edriver] pokePhysBytes: pokeMemory rejected pa=0x" << std::hex << (pa + i) << " (PMA not writable)\n";
+            sparta_assert(false, "pokePhysBytes pokeMemory rejected pa=0x" << std::hex << (pa + i));
+            return false;
+        }
+    }
+    return true;
 }
 
 //==================== Serialization Checks ====================
@@ -241,6 +335,9 @@ bool ExecutionDriver::isSerializing(const std::shared_ptr<TT_PERF::InstrPac> &pa
         unsigned(CN::VTYPE), unsigned(CN::VLENB), unsigned(CN::VCSR),   unsigned(CN::VXRM),   unsigned(CN::VXSAT),
     };
     const WdRiscv::DecodedInst &di = pacPtr->decodedInst();
+    // Serialize AMOs and LRs in multi-hart mode: PerfApi takes an LR's reservation at retire, so an LR
+    // executed early misses a remote store between its execute and retire and the paired SC still succeeds.
+    if ((di.isAmo() || di.isLr()) && mPerfApiHandle->hartCount() > 1) return true;
     if (di.instEntry() != nullptr) {
         switch (di.instEntry()->instId()) {
             case WdRiscv::InstId::csrrs:
@@ -287,10 +384,62 @@ address_t ExecutionDriver::getNextPc() {
     return mNextPc;
 }
 
+address_t ExecutionDriver::fetchPa(address_t va) const {
+    uint64_t pa = va;
+    if (mPerfApiHandle->translateInstrAddr(mHartIx, va, pa) != WdRiscv::ExceptionCause::NONE) pa = va;
+    return tagPa(pa);
+}
+
+bool ExecutionDriver::translationOn() const {
+    if (!mHartPtr || mHartPtr->privilegeMode() == WdRiscv::PrivilegeMode::Machine || !mHartPtr->isRvs()) return false;
+    // SATP aliases to VSATP in virtual mode; HGATP shares its MODE field position.
+    constexpr unsigned modeShift = sizeof(XlenType) == 8 ? 60 : 31;
+    XlenType satp = 0, hgatp = 0;
+    if (mHartPtr->peekCsr(WdRiscv::CsrNumber::SATP, satp) && (satp >> modeShift) != 0) return true;
+    return mHartPtr->virtMode() && mHartPtr->peekCsr(WdRiscv::CsrNumber::HGATP, hgatp) && (hgatp >> modeShift) != 0;
+}
+
+uint32_t ExecutionDriver::currentAsid() const {
+    XlenType satp = 0;
+    if (!mHartPtr->peekCsr(WdRiscv::CsrNumber::SATP, satp)) return 0;
+    return sizeof(XlenType) == 8 ? (satp >> 44) & 0xffff : (satp >> 22) & 0x1ff;
+}
+
+ExecutionDriver::PageWalk ExecutionDriver::walkPageTable(address_t va, bool fetch, bool store, uint64_t tag) const {
+    std::vector<WdRiscv::VirtMem::Walk> walks;
+    uint64_t pa = va;
+    const uint64_t perfApiTag = tag + mSnapshotOffset + 1;
+    WdRiscv::ExceptionCause cause;
+    if (fetch)
+        cause = mPerfApiHandle->translateInstrAddr(mHartIx, va, pa, walks);
+    else if (store)
+        cause = mPerfApiHandle->translateStoreAddrForTag(mHartIx, perfApiTag, va, pa, walks);
+    else
+        cause = mPerfApiHandle->translateLoadAddrForTag(mHartIx, perfApiTag, va, pa, walks);
+
+    PageWalk out;
+    out.fault = cause != WdRiscv::ExceptionCause::NONE;
+    out.pa = tagPa(pa);
+    if (walks.empty()) return out;
+    // A page crosser's second walk is not modelled. Stage-1 PTE addresses of a two-stage walk
+    // are guest-physical, which is close enough for cache timing.
+    const auto &first = walks.front();
+    const auto &timed = first.isOneStage() ? std::span(walks).first(1) : std::span(walks);
+    for (const auto &w : timed) {
+        for (uint64_t a : w.pteAddrs()) out.pte_addrs.push_back(tagPa(a));
+    }
+    if (first.isOneStage()) {
+        out.levels = first.maxLevels();
+        out.page_size = first.leafPageSize();
+        out.global = first.complete() && !out.fault && ((first.pteValues().back() >> 5) & 1);  // PTE.G
+    }
+    return out;
+}
+
 //==================== Instruction Lifecycle ====================
 
 InstPtr ExecutionDriver::peekInstruction(address_t fetchPc, bool onSpeculativePath) {
-    if (mFinishedOverride) {
+    if (mProgramEnded || mFinishedOverride) {
         ILOG("[peekInstruction] mFinishedOverride flag raised, pausing fetch");
         return nullptr;
     }
@@ -308,7 +457,8 @@ InstPtr ExecutionDriver::peekInstruction(address_t fetchPc, bool onSpeculativePa
     }
 
     // Wrong-path invalid-state detection. Fetch resumes only after a flush clears the state.
-    if (onSpeculativePath && pacPtr->decodedInst().instId() == WdRiscv::InstId::illegal) {
+    const auto &decoded = pacPtr->decodedInst();
+    if (onSpeculativePath && (decoded.instId() == WdRiscv::InstId::illegal || isVectorWithoutV(decoded))) {
         ILOG("[peekInstruction] Speculative illegal instruction at Pc: " << std::hex << fetchPc << std::dec << " InstId: " << instId
                                                                          << " -- entering driver invalid state, stopping wrong-path fetch");
         // Erase the PerfApi packet that the fetch above just inserted at this tag and abandon
@@ -360,6 +510,11 @@ bool ExecutionDriver::executeInstruction(InstPtr &inst, bool onSpeculativePath) 
 
         if (pacPtr->trapped()) {
             ILOG("[executeInstruction] Instruction " << modelTag << " encountered trap");
+            // Stop speculative fetch past a wrong-path fault
+            if (onSpeculativePath) {
+                mDriverInvalidState = true;
+                mInvalidStateTag = modelTag;
+            }
         }
 
         bool traceRecordSuccess = populateTraceRecord(inst->getMutableTraceRecord(), pacPtr);
@@ -428,7 +583,22 @@ bool ExecutionDriver::retireInstruction(uint64_t tag) {
 
     bool success;
     try {
-        success = perfApi.retire(mHartIx, 0, perfApiTag);
+        TT_PERF::RetireResult retireStatus = TT_PERF::RetireResult::Success;
+        success = perfApi.retire(mHartIx, 0, perfApiTag, &retireStatus);
+
+        // Async interrupt taken at commit: PerfApi::retire's single-step took the interrupt
+        // instead of committing this instruction (it re-executes after the handler returns).
+        // PerfApi has rolled back its retire pointer and left the packet un-retired. Report
+        // non-retirement (return false): Writeback keeps the instruction at the ROB head and
+        // the authoritative redirect flushes it inclusive and redirects fetch to the handler
+        // (whose entry PC is the hart's current PC).
+        if (retireStatus == TT_PERF::RetireResult::InterruptPreempted) {
+            mNextPc = mHartPtr->peekPc();  // handler entry
+            mNextPcSet = true;
+            ILOG("[retireInstruction] Async interrupt preempts tag " << tag << " cause=0x" << std::hex << mHartPtr->lastTrapCause() << " handler=0x" << mNextPc
+                                                                     << std::dec << "; not retiring");
+            return false;
+        }
 
         sparta_assert(success, "[ExecutionDriver] Error in retiring instruction " << std::dec << tag << " Pc: " << std::hex << pacPtr->instrVa() << std::dec);
 
@@ -446,7 +616,9 @@ bool ExecutionDriver::retireInstruction(uint64_t tag) {
             mNextPcSet = true;
         }
 
-        if (pacPtr->isStore() || pacPtr->isVectorStore() || pacPtr->isCbo_zero() || pacPtr->isSc() || pacPtr->isAmo()) {
+        // With more than one hart, PerfApi::retire has already drained an AMO.
+        const bool amoDrained = pacPtr->isAmo() && perfApi.hartCount() > 1;
+        if (!amoDrained && (pacPtr->isStore() || pacPtr->isVectorStore() || pacPtr->isCbo_zero() || pacPtr->isSc() || pacPtr->isAmo())) {
             // The store commit happens here; a store to the HTIF "tohost" address
             // is committed via drainStore and can throw CoreException (see below).
             success = success && perfApi.drainStore(mHartIx, 0, perfApiTag);
@@ -462,6 +634,20 @@ bool ExecutionDriver::retireInstruction(uint64_t tag) {
         const uint64_t exitCode = e.value() >> 1;  // HTIF: payload bit0=done, rest=code
         ILOG("[retireInstruction] tohost stop on tag " << tag << " (exit code " << exitCode << "); finishing run");
         mFinishedOverride = true;
+        mProgramEnded = true;
+    }
+
+    if (isRegionEndMarker(pacPtr->decodedInst())) {
+        ILOG("[retireInstruction] region-end HINT on tag " << tag << "; ending the run");
+        mProgramEnded = true;
+    }
+
+    if (const auto &di = pacPtr->decodedInst();
+        mSfenceHook && !pacPtr->trapped() && (di.instId() == WdRiscv::InstId::sfence_vma || di.instId() == WdRiscv::InstId::sinval_vma)) {
+        mSfenceHook({.all_va = di.op0() == 0,
+                     .va = mHartPtr->peekIntReg(di.op0()),
+                     .all_asid = di.op1() == 0,
+                     .asid = static_cast<uint32_t>(mHartPtr->peekIntReg(di.op1()))});
     }
 
     mRetireSequence++;
@@ -523,7 +709,7 @@ const std::shared_ptr<TT_PERF::InstrPac> ExecutionDriver::processNextRecordHelpe
     // pacPtr methods may not return correct values until after execution for some instruction types
     const bool needsExecute = decodedInst.isBranchToRegister() || decodedInst.isLoad() || decodedInst.isStore() || decodedInst.isVectorLoad() ||
                               decodedInst.isVectorStore() || decodedInst.isAmo();
-    if ((!flush && execute) || (needsExecute && !isSerializing(pacPtr))) {
+    if (!isVectorWithoutV(decodedInst) && ((!flush && execute) || (needsExecute && !isSerializing(pacPtr)))) {
         ok = perfApi.execute(mHartIx, 0, tag);
         sparta_assert(ok, "Execute failure in execution driver");
     }
@@ -584,6 +770,13 @@ bool ExecutionDriver::populateRecordOperands(WhisperUtil::TraceRecord &record, c
         WhisperUtil::Operand operand;
         populateOperand(sourceOperands.at(i), operand, false);
         record.sourceOperands.emplace_back(operand);
+        // A register-group source reads every register in the group, as the flattened destinations write them.
+        if (operand.type == WhisperUtil::OperandType::Vec) {
+            for (unsigned r = 1; r < sourceOperands.at(i).lmul; r++) {
+                WhisperUtil::Operand member{.type = operand.type, .number = operand.number + r};
+                record.sourceOperands.emplace_back(member);
+            }
+        }
     }
 
     for (unsigned i = 0; i < destCount; i++) {
@@ -658,7 +851,7 @@ bool ExecutionDriver::populateRegularMemoryOps(WhisperUtil::TraceRecord &record,
     }
 
     record.virtAddrs.emplace_back(pacPtr->dataVa());
-    record.physAddrs.emplace_back(pacPtr->dataPa());
+    record.physAddrs.emplace_back(tagPa(pacPtr->dataPa()));
     record.maskedAddrs.emplace_back(false);
 
     if (pacPtr->dataPa2() != 0 && pacPtr->dataPa2() != pacPtr->dataPa() && pacPtr->dataPa2() != pacPtr->dataVa()) {
@@ -695,7 +888,7 @@ bool ExecutionDriver::populateVectorMemoryOps(WhisperUtil::TraceRecord &record, 
 
     for (const auto &vecDataAddr : vecDataAddrs) {
         record.virtAddrs.emplace_back(std::get<0>(vecDataAddr));
-        record.physAddrs.emplace_back(std::get<1>(vecDataAddr));
+        record.physAddrs.emplace_back(tagPa(std::get<1>(vecDataAddr)));
         record.maskedAddrs.emplace_back(std::get<2>(vecDataAddr));
     }
 
@@ -733,7 +926,7 @@ bool ExecutionDriver::populateTraceRecord(WhisperUtil::TraceRecord &record, cons
     }
 
     record.virtPc = pacPtr->instrVa();
-    record.physPc = pacPtr->interupted() ? record.virtPc : pacPtr->instrPa();
+    record.physPc = tagPa(pacPtr->interupted() ? record.virtPc : pacPtr->instrPa());
     record.inst = dI.inst();
     record.instSize = pacPtr->instrSize();
 
@@ -750,14 +943,21 @@ bool ExecutionDriver::populateTraceRecord(WhisperUtil::TraceRecord &record, cons
     } else if (dI.isUnconditionalBranch())
         record.instType = 'j';
     else if (dI.isVector()) {
-        // Use DecodedInst for vector detection, pacPtr for load/store distinction
-        if (pacPtr->isVectorLoad() || pacPtr->isVectorStore()) record.instType = 'v';
+        // Vector memory ops are loads/stores so they go through the LSQ and D-cache.
+        if (pacPtr->isVectorLoad())
+            record.instType = 'l';
+        else if (pacPtr->isVectorStore())
+            record.instType = 's';
+        else
+            record.instType = 'v';
     } else if (dI.isLoad())
         record.instType = 'l';
     else if (dI.isStore())
         record.instType = 's';
     else if (dI.isAmo())
         record.instType = 'a';
+    else if (dI.isFp())
+        record.instType = 'f';
 
     populateRecordOperands(record, pacPtr);
 

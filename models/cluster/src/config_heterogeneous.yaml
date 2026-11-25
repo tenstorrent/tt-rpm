@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
+
+# Heterogeneous cluster example: a mix of "big" and "little" CPU types.
+#
+# Run directly with:  ./cluster --cluster-config config_heterogeneous.yaml
+#
+# Each cpu_type names its own core CPU config file (geometry), its private-L2
+# topology, and its clock. The `cores` list assigns types to specific core ids
+# (== hart ids). See config.yaml for the full schema documentation.
+
+# ---- Cluster (generic, shared by all cores) ----
+cache_hit_latency: 12
+cache_miss_latency: 100
+cluster_cache_size_kb: 2048
+cluster_cache_associativity: 8
+line_size: 64
+coherence_enabled: true             # MSI directory: snoop-invalidate sharers, grant S/M
+coherence_latency: 0
+
+# ---- CPU type library ----
+# A type is just a name + its core config file. Everything about the core -- pipeline
+# widths, cache sizes, AND whether it has a private L2 (l2cache.params.enabled) -- lives
+# in that file. Here big cores are wide AND keep a private L2 (cluster cache as L3);
+# little cores are narrow with no private L2 (L1 -> shared cluster cache).
+cpu_types:
+  big:
+    core_config: core_big.yaml     # wide core, private L2 enabled
+    cpu_freq: 3.0                  # GHz -- big cores run faster than the shared cache clock
+  little:
+    core_config: core_little.yaml  # narrow core, no private L2
+    cpu_freq: 2.0                  # GHz -- little cores run slower
+
+# ---- Core assignment (total = number of cores) ----
+# Explicit hartids: 2 big on harts 0-1, 4 little on harts 2-5. In ELF/snapshot mode
+# hartids must be contiguous 0..N-1 (harts are positional); `hartids` fixes the mapping.
+cores:
+  - { type: big,    hartids: [0, 1] }
+  - { type: little, hartids: "2-5" }
+
+# ---- Clock domains ----
+# Per-type cpu_freq puts each core in its own clock domain; the shared cache runs in a
+# separate (fabric/uncore) domain, connected by a per-core clock-crossing bridge
+# (SyncPorts), so cores of different frequencies coexist. `cache_freq` sets the fabric
+# clock and may be BELOW the cores (the realistic uncore case); omit it for the 2 GHz
+# default. Cache access latency is modeled in the cache domain, so the crossing is a
+# fixed 1-cycle synchronizer regardless of the ratio.
+cache_freq: 2.0                      # GHz -- shared-cache / fabric clock (slower than big cores)
+
+# ---- Workload (pick one) ----
+program: ""
+snapshot: ""
+
+instruction_limit: 0
+
+verbose: false

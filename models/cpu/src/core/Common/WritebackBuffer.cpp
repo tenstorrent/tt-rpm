@@ -5,6 +5,8 @@
 
 #include <algorithm>
 
+#include "Common/SpeculationUtils.hpp"
+
 namespace midcore {
 
 void WritebackBuffer::configure(const Config& cfg) {
@@ -13,8 +15,8 @@ void WritebackBuffer::configure(const Config& cfg) {
     mWritebackLatency = cfg.writeback_latency;
 }
 
-bool WritebackBuffer::accept(uint64_t tag, uint64_t fetch_seq, const std::vector<core::PhysRegRef>& phys_dsts, const core::ROBToken& rob_token,
-                             uint8_t source_id) {
+bool WritebackBuffer::accept(uint64_t tag, uint64_t fetch_seq, uint8_t wrong_path_depth, const std::vector<core::PhysRegRef>& phys_dsts,
+                             const core::ROBToken& rob_token, uint8_t source_id) {
     if (mEntries.size() >= mCapacity) {
         ++mNumStalls;
         return false;
@@ -26,6 +28,7 @@ bool WritebackBuffer::accept(uint64_t tag, uint64_t fetch_seq, const std::vector
     e.phys_dsts = phys_dsts;
     e.rob_token = rob_token;
     e.source_id = source_id;
+    e.wrong_path_depth = wrong_path_depth;
     e.cycles_remaining = mWritebackLatency;
     e.ready = (mWritebackLatency == 0);
 
@@ -64,6 +67,12 @@ void WritebackBuffer::remove(uint64_t tag) {
         mEntries.erase(it);
         ++mNumDrained;
     }
+}
+
+uint32_t WritebackBuffer::squash(const core::FlushRequest& req) {
+    const size_t before = mEntries.size();
+    std::erase_if(mEntries, [&req](const Entry& e) { return core::shouldSquash(e.tag, e.wrong_path_depth, req); });
+    return static_cast<uint32_t>(before - mEntries.size());
 }
 
 }  // namespace midcore

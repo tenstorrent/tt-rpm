@@ -17,6 +17,7 @@
 namespace cpu {
 
 enum class InstClass { ALU, Multiply, Divide, Load, Store, Branch, Jump, Float, Vector, Atomic, Custom };
+enum class FpDivPrecision : uint8_t { None, Single, Double };  // FP or vector divide/sqrt, by element width
 
 class Instruction : public TrackedAllocationPerCore<Instruction> {
    public:
@@ -36,7 +37,7 @@ class Instruction : public TrackedAllocationPerCore<Instruction> {
 
     InstClass getInstClass() const { return mInstClass; }
     void refreshInstClass();  // Call after TraceRecord is updated
-    uint8_t getLatency() const { return mLatency; }
+    FpDivPrecision getFpDivPrecision() const { return mFpDivPrecision; }
 
    private:
     WhisperUtil::TraceRecord mRecord;
@@ -45,7 +46,7 @@ class Instruction : public TrackedAllocationPerCore<Instruction> {
     InstFlagType mFlags = 0;
     bool mIsPerfApiSerializing = false;
     InstClass mInstClass = InstClass::ALU;
-    uint8_t mLatency = 1;
+    FpDivPrecision mFpDivPrecision = FpDivPrecision::None;
 };
 
 using InstPtr = sparta::SpartaSharedPointer<Instruction>;

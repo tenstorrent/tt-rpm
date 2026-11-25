@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
+
+# Cluster experiment: run the multi-core cluster model.
+#
+# The cluster binary reads its topology (cpu_types + cores) from
+# config.yaml (copied next to the binary in the study dir), which points at
+# core_config.yaml for the dropped-in core's CPU geometry. The default config.yaml
+# defines 3 cores; edit its `cores` list (or point --cluster-config at another file)
+# to change the count/layout.
+#
+# Snapshots are execution-driven with no trace EOF and stop on their own only if a core
+# commits the ROI-exit HINT (addi x0, x12, imm), so the run must be bounded here. -i ends
+# the whole run when the first core retires num_instructions; for heterogeneous cores use
+# num_cycles instead.
+
+- config_name: cluster3
+  model: cluster
+  num_instructions: 20000000

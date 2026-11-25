@@ -10,6 +10,8 @@
 
 #include "models/cpu/common/BaseTypes.hpp"
 #include "models/cpu/common/Instruction.hpp"
+#include "models/cpu/common/MemInterface.hpp"
+#include "models/cpu/predictors/common/PredictorTypes.hpp"
 
 namespace core {
 
@@ -77,7 +79,8 @@ struct DecodePacket {
     uint8_t latency{1};
     bool predicted_taken{false};
     bool was_mispredicted{false};
-    bool after_mispredict_stall{false};  // First uop Decode delivered after a misprediction stall (top-down accounting)
+    bool target_mispredicted{false};  // predicted taken to the wrong target
+    bool direct_jump{false};          // JAL/C.J/C.JAL: Decode computes the target, so it never mispredicts
 };
 
 // Token returned by the ROB on allocate — carries both slot index and epoch
@@ -98,7 +101,8 @@ struct ROBEntry {
     std::vector<PhysRegRef> new_phys_dsts;  // Released to free list on squash
     bool completed{false};
     uint32_t epoch{0};
-    std::optional<uint32_t> checkpoint_slot;  // Only branches have checkpoints
+    uint64_t dispatch_cycle{0};  // Cycle allocated (retire-stall load age)
+    bool was_mispredicted{false};
 };
 
 // Flows Rename → Issue (carries physical register mappings for scoreboard)
@@ -113,9 +117,11 @@ struct RenamedPacket {
     // Routing hint: scheduler containing the primary producer (set by Rename)
     // Used for dependency-aware load balancing. 255 = no hint / unknown.
     uint8_t producer_scheduler{255};
+    uint8_t scheduler{255};  // Issue scheduler routed to at dispatch, which holds its reserved slot
 
     bool predicted_taken{false};
     bool was_mispredicted{false};
+    bool target_mispredicted{false};
 
     // Checkpoint slot for branches (used for misprediction recovery)
     std::optional<uint32_t> checkpoint_slot;
@@ -132,10 +138,12 @@ struct IssuePacket {
 
     bool predicted_taken{false};
     bool was_mispredicted{false};
+    bool target_mispredicted{false};
 
     // Construct from RenamedPacket (drops producer_scheduler hint)
     static IssuePacket from(const RenamedPacket& rpkt) {
-        return {rpkt.pkt, rpkt.uop_type, rpkt.latency, rpkt.rob_token, rpkt.phys_srcs, rpkt.phys_dsts, rpkt.predicted_taken, rpkt.was_mispredicted};
+        return {rpkt.pkt,       rpkt.uop_type,        rpkt.latency,          rpkt.rob_token,          rpkt.phys_srcs,
+                rpkt.phys_dsts, rpkt.predicted_taken, rpkt.was_mispredicted, rpkt.target_mispredicted};
     }
 };
 
@@ -205,6 +213,9 @@ struct MemRequest {
     cpu::address_t address{0};  // effective address for structural cache lookup
     uint8_t access_size{4};     // access width in bytes (1, 2, 4, 8)
     bool is_store{false};
+    bool exclusive{false};  // atomic: a read that takes the line exclusive and writes it
+    uint64_t req_id{0};     // echoed in the response; tells a squashed load's access from its tag's reuse
+    bool page_walk{false};  // PTE load: not a demand access to the prefetcher
 };
 
 inline std::ostream& operator<<(std::ostream& os, const MemRequest& req) {
@@ -215,6 +226,7 @@ inline std::ostream& operator<<(std::ostream& os, const MemRequest& req) {
 
 struct MemResponse {
     uint64_t tag{0};
+    uint64_t req_id{0};
     bool miss{false};
 };
 
@@ -223,45 +235,7 @@ inline std::ostream& operator<<(std::ostream& os, const MemResponse& resp) {
     return os;
 }
 
-// L1 → L2 fill request (sent when L1 structural-mode CacheInterface misses).
-struct FillRequest {
-    cpu::address_t line_addr{0};
-};
-
-inline std::ostream& operator<<(std::ostream& os, const FillRequest& r) {
-    os << "FillRequest{line=0x" << std::hex << r.line_addr << std::dec << "}";
-    return os;
-}
-
-// L2 → L1 fill response (sent when the L2 has finished fetching the line).
-struct FillResponse {
-    cpu::address_t line_addr{0};
-};
-
-inline std::ostream& operator<<(std::ostream& os, const FillResponse& r) {
-    os << "FillResponse{line=0x" << std::hex << r.line_addr << std::dec << "}";
-    return os;
-}
-
-// L1 → L2 writeback request (sent when dirty L1 line is evicted).
-struct WritebackRequest {
-    cpu::address_t line_addr{0};
-};
-
-inline std::ostream& operator<<(std::ostream& os, const WritebackRequest& r) {
-    os << "WritebackRequest{line=0x" << std::hex << r.line_addr << std::dec << "}";
-    return os;
-}
-
-// L2 → L1 invalidate request (sent for inclusive L2 back-invalidation).
-struct InvalidateRequest {
-    cpu::address_t line_addr{0};
-};
-
-inline std::ostream& operator<<(std::ostream& os, const InvalidateRequest& r) {
-    os << "InvalidateRequest{line=0x" << std::hex << r.line_addr << std::dec << "}";
-    return os;
-}
+// Inter-cache fill/writeback/invalidate packets live in mem:: (MemInterface.hpp).
 
 struct BranchPrediction {
     uint64_t tag{0};
@@ -272,6 +246,9 @@ struct BranchPrediction {
     uint8_t wrong_path_depth{0};  // Speculation depth of the branch instruction
     bool predicted_taken{false};
     bool mispredicted{false};
+    predictors::BranchType type{predictors::BranchType::Conditional};
+    bool target_mispredicted{false};  // predicted taken to the wrong target
+    bool misfetch{false};             // Decode redirects fetch onto the predicted path
 };
 
 inline std::ostream& operator<<(std::ostream& os, const BranchPrediction& bp) {
@@ -290,6 +267,8 @@ struct BranchRedirect {
     uint64_t correct_target_pc{0};
     uint8_t wrong_path_depth{0};
     bool was_taken{false};
+    // Retire-time trap/interrupt from the committed ROB head: bypasses the stale filter.
+    bool authoritative{false};
 };
 
 inline std::ostream& operator<<(std::ostream& os, const BranchRedirect& br) {
@@ -353,7 +332,8 @@ struct FlushRequest {
     uint64_t target_pc{0};
     uint8_t branch_depth{0};
     bool predicted_taken{false};
-    bool was_taken{false};  // Actual branch outcome (for Execute misprediction recovery)
+    bool was_taken{false};      // Actual branch outcome (for Execute misprediction recovery)
+    bool authoritative{false};  // retire-time trap/interrupt redirect; bypasses the stale filter
 };
 
 inline std::ostream& operator<<(std::ostream& os, const FlushRequest& fr) {

@@ -6,6 +6,7 @@
 #include <deque>
 #include <memory>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -20,16 +21,25 @@
 #include "Common/WritePortArbiter.hpp"
 #include "LoadStoreUnit/LoadQueue.hpp"
 #include "LoadStoreUnit/StoreQueue.hpp"
+#include "LoadStoreUnit/StoreSetPredictor.hpp"
+
+namespace core {
+class Mmu;
+}
 
 namespace midcore {
 
 class BackendMemoryStructures;
+class ReorderBuffer;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LSQ — Load Store Queue (actually Load-Store Unit)
 //
 // Manages separate load and store queues with support for:
 //  - Store-to-load forwarding from the SQ
+//  - Memory-dependence prediction (store sets) and ordering-violation replay
+//  - Fences, and atomics performed at the ROB head with the line held exclusive
+//  - Per-cycle load and store port limits
 //  - Per-bank queues (when num_banks > 1)
 //  - Write-port arbitration for load completions
 //  - In-order ROB completion
@@ -41,9 +51,15 @@ class LSQParams : public sparta::ParameterSet {
         : sparta::ParameterSet(n) {}
 
     PARAMETER(uint32_t, load_queue_capacity, 32, "Load queue capacity")
-    PARAMETER(uint32_t, store_queue_capacity, 24, "Store queue capacity")
+    PARAMETER(uint32_t, store_queue_capacity, 32, "Store queue capacity")
     PARAMETER(bool, store_forwarding, true, "Enable store-to-load forwarding")
     PARAMETER(uint32_t, forwarding_latency, 1, "Cycles for forwarded load to complete")
+    PARAMETER(uint32_t, load_ports, 2, "Loads per cycle that can access the D-cache or forward")
+    PARAMETER(uint32_t, store_ports, 1, "Retired stores written to the D-cache store buffer per cycle")
+    PARAMETER(std::string, mem_dep_predictor, "store_sets", "Loads vs unknown-address older stores: store_sets | blind | none")
+    PARAMETER(uint32_t, ssit_entries, 4096, "Store-set ID table entries")
+    PARAMETER(uint32_t, lfst_entries, 128, "Last-fetched-store table entries (number of store sets)")
+    PARAMETER(uint64_t, ssit_clear_interval, 1000000, "Cycles between store-set table clears (0 = never)")
     PARAMETER(uint32_t, num_banks, 1, "Number of banks (1 = no banking)")
     PARAMETER(uint32_t, cache_line_size, 64, "Cache line size in bytes (for bank indexing)")
 };
@@ -75,17 +91,26 @@ class LSQ : public sparta::Unit {
     void processWritePortGrants();
 
     void setCache(midcore::BackendMemoryStructures* dcache) { mDcache = dcache; }
+    void setMmu(core::Mmu* mmu) { mMmu = mmu; }
     void setArbiter(WritePortArbiter* arb) { mArbiter = arb; }
     void setVisualizer(core::PipelineVisualizer* v) { mVis = v; }
+    void setROB(const midcore::ReorderBuffer* rob) { mRob = rob; }
 
-    // ── Store commit notification (called when ROB retires a store) ──────────
+    // Destinations of the live load with this tag if a single D-cache access completes it, else nullptr.
+    const std::vector<core::PhysRegRef>* singleAccessLoadDsts(uint64_t tag, uint64_t req_id) const;
+
+    // ── Commit notifications (called when the ROB retires a memory op) ───────
 
     void commitStore(uint64_t tag);
+    void commitLoad(uint64_t tag);
+
+    // The load must be replayed: an older store to its bytes resolved after it read them.
+    bool hasOrderingViolation(uint64_t tag) const;
 
     bool canClaimLoad() const { return mLoadCredits > 0; }
     bool canClaimStore() const { return mStoreCredits > 0; }
-    void claimLoad(uint64_t fetch_seq, uint64_t tag, uint8_t depth);
-    void claimStore(uint64_t fetch_seq, uint64_t tag, uint8_t depth);
+    // Claims an LQ entry for a load, an SQ entry for a store, atomic or fence.
+    void claim(const core::DecodePacket& dp);
 
     // ── Stats ────────────────────────────────────────────────────────────────
 
@@ -136,13 +161,25 @@ class LSQ : public sparta::Unit {
 
     // Helpers
     uint32_t bankFor(cpu::address_t addr) const;
-    void dispatchLoad(const core::IssuePacket& ipkt, cpu::address_t addr, uint8_t size);
-    void dispatchStore(const core::IssuePacket& ipkt, cpu::address_t addr, uint8_t size);
+    std::vector<cpu::address_t> linesTouched_(const WhisperUtil::TraceRecord& rec) const;
+    std::vector<MemRange> rangesTouched_(const WhisperUtil::TraceRecord& rec) const;
     void tryIssueLoads();
     void tryDrainStores();
     void drainCompletedEntries();
-    bool checkStoreForwarding(LoadQueue::Entry& load);
     void sampleOccupancyStats();
+    bool storeTranslated_(uint64_t tag);
+
+    enum WaitReason : uint8_t { kWaitBarrier = 1, kWaitStoreSet = 2, kWaitOverlap = 4 };
+    enum class LoadStep : uint8_t { Wait, Forward, ReadCache };
+    LoadStep orderLoad_(LoadQueue::Entry& load, uint64_t barrier_tag, const StoreQueue::Entry*& src);
+    bool storeResolved_(uint64_t seq) const;
+    const StoreQueue::Entry* youngestOlderStore_(const LoadQueue::Entry& load) const;
+    uint64_t oldestBarrierTag_() const;
+    bool olderStoresDrained_(uint64_t tag) const;
+    void checkOrderingViolation_(const StoreQueue::Entry& st);
+    void completeFences_();
+    void issueAtomics_();
+    void finishSqEntry_(StoreQueue::Entry& e);
 
     void returnLoadCredit() {
         if (mLoadCredits < mLoadCreditCap) ++mLoadCredits;
@@ -150,9 +187,23 @@ class LSQ : public sparta::Unit {
     void returnStoreCredit() {
         if (mStoreCredits < mStoreCreditCap) ++mStoreCredits;
     }
-    // Returns true if a live claim existed (and consumes it). False means a flush already
-    // refunded this op's credit (it was squashed in flight) -- the caller must not enqueue it.
-    bool claimArrived_(uint64_t fetch_seq) { return mClaimedNotArrived.erase(fetch_seq) > 0; }
+    struct ClaimInfo {
+        uint64_t tag{0};
+        uint8_t depth{0};
+        bool is_store{false};  // holds an SQ credit
+        bool barrier{false};   // fence or acquire atomic: younger loads wait for it
+        cpu::address_t pc{0};
+        uint64_t dep_seq{StoreSetPredictor::kNone};  // load: predicted store; store: set predecessor
+    };
+    // Returns the live claim (and consumes it). Empty means a flush already refunded this
+    // op's credit (it was squashed in flight) -- the caller must not enqueue it.
+    std::optional<ClaimInfo> claimArrived_(uint64_t fetch_seq) {
+        auto it = mClaimedNotArrived.find(fetch_seq);
+        if (it == mClaimedNotArrived.end()) return std::nullopt;
+        ClaimInfo c = it->second;
+        mClaimedNotArrived.erase(it);
+        return c;
+    }
     void claimSquashed_(uint64_t fetch_seq) {
         auto it = mClaimedNotArrived.find(fetch_seq);
         if (it == mClaimedNotArrived.end()) return;
@@ -176,18 +227,13 @@ class LSQ : public sparta::Unit {
         bool rob_sent{false};   // ROB completion already sent (for stores that haven't drained yet)
     };
     std::deque<CompletionEntry> mCompletionOrder;
-    std::unordered_set<uint64_t> mLoadCompletedTags;   // O(1) lookup for completed loads
-    std::unordered_set<uint64_t> mFlushedPendingTags;  // Tags with pending D-cache requests that were flushed
+    std::unordered_set<uint64_t> mLoadCompletedTags;  // O(1) lookup for completed loads
+    uint64_t mNextReqId{0};
 
     int32_t mLoadCredits{0};
     int32_t mStoreCredits{0};
     int32_t mLoadCreditCap{0};
     int32_t mStoreCreditCap{0};
-    struct ClaimInfo {
-        uint64_t tag{0};
-        uint8_t depth{0};
-        bool is_store{false};
-    };
     std::unordered_map<uint64_t, ClaimInfo> mClaimedNotArrived;
 
     // Track most recent flush for filtering late-arriving packets
@@ -199,11 +245,21 @@ class LSQ : public sparta::Unit {
     uint32_t mLineShift;
     bool mForwardingEnabled;
     uint32_t mForwardingLatency;
+    uint32_t mLoadPorts;
+    uint32_t mStorePorts;
+    enum class MemDepMode : uint8_t { StoreSets, Blind, None };
+    MemDepMode mMemDepMode;
+    uint64_t mSsitClearInterval;
+    StoreSetPredictor mStoreSets;
+
+    uint32_t mLoadPortsLeft{0};
 
     // External references
     midcore::BackendMemoryStructures* mDcache{nullptr};
+    core::Mmu* mMmu{nullptr};
     WritePortArbiter* mArbiter{nullptr};
     core::PipelineVisualizer* mVis{nullptr};
+    const midcore::ReorderBuffer* mRob{nullptr};
 
     // Buffers
     std::vector<core::ROBToken> mRobCompletionsBuf;
@@ -214,6 +270,15 @@ class LSQ : public sparta::Unit {
     sparta::Counter mNumStores;
     sparta::Counter mNumForwards;
     sparta::Counter mNumSquashed;
+    sparta::Counter mNumAtomics;
+    sparta::Counter mNumFences;
+    sparta::Counter mNumViolations;
+    sparta::Counter mNumStaleResponses;
+    sparta::Counter mNumStoreSetWaits;
+    sparta::Counter mNumOverlapWaits;
+    sparta::Counter mNumBarrierWaits;
+    sparta::Counter mNumLoadPortStalls;
+    sparta::Counter mNumStorePortStalls;
 
     sparta::Counter mMaxLqOccupancy;
     sparta::Counter mMaxSqOccupancy;

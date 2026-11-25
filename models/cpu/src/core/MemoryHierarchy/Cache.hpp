@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <list>
 #include <memory>
@@ -11,6 +13,8 @@
 
 #include "sparta/utils/MathUtils.hpp"
 #include "sparta/utils/SpartaAssert.hpp"
+
+#include "MemoryHierarchy/ReplacementRegistry.hpp"
 
 namespace cpu {
 
@@ -93,67 +97,71 @@ class TreePLRUReplacement : public ReplacementIF {
     std::vector<uint8_t> mBits;
 };
 
-// ── Factory ──
-
-enum class ReplacementPolicy { TRUE_LRU, TREE_PLRU };
-
-inline ReplacementPolicy stringToReplacementPolicy(const std::string& s) {
-    if (s == "lru" || s == "truelru") return ReplacementPolicy::TRUE_LRU;
-    if (s == "plru" || s == "treeplru") return ReplacementPolicy::TREE_PLRU;
-    sparta_assert(false, "Unknown replacement policy: " << s);
-    return ReplacementPolicy::TRUE_LRU;
-}
-
-inline std::unique_ptr<ReplacementIF> createReplacementPolicy(ReplacementPolicy p, uint32_t ways) {
-    switch (p) {
-        case ReplacementPolicy::TRUE_LRU:
-            return std::make_unique<LRUReplacement>(ways);
-        case ReplacementPolicy::TREE_PLRU:
-            return std::make_unique<TreePLRUReplacement>(ways);
-    }
-    sparta_assert(false, "Unknown replacement policy");
-    return nullptr;  // unreachable
-}
+// Registered in Replacement.cpp.
 
 // ── CacheLine ──
+
+// Max line size the inline data-carrying shadow buffer supports (bytes). Lines are 64 B in
+// this model; the buffer is only touched when data-carrying mode is enabled on the owning cache.
+inline constexpr uint32_t kMaxLineBytes = 64;
 
 class CacheLine {
    public:
     bool isValid() const noexcept { return mValid; }
     bool isModified() const noexcept { return mModified; }
+    bool isPrefetched() const noexcept { return mPrefetched; }
+    bool isUnique() const noexcept { return mUnique; }
     address_t getTag() const noexcept { return mTag; }
     address_t getAddress() const noexcept { return mAddress; }
 
     void setModified(bool m) noexcept { mModified = m; }
+    void setPrefetched(bool p) noexcept { mPrefetched = p; }
+    void setUnique(bool u) noexcept { mUnique = u; }
 
     void initialize(address_t addr, address_t tag) noexcept {
         mValid = true;
         mModified = false;
+        mPrefetched = false;
+        mUnique = false;
         mTag = tag;
         mAddress = addr;
     }
     void invalidate() noexcept {
         mValid = false;
         mModified = false;
+        mPrefetched = false;
+        mUnique = false;
         mTag = 0;
         mAddress = 0;
     }
+
+    // ── Data-carrying shadow ──────────────────────────────────────────
+    // The 64 B line contents, a timing-model shadow seeded from Whisper on fill. NEVER the
+    // architectural source of a load result (Whisper stays authoritative); used only for
+    // coherence/traffic realism and the shadow-vs-oracle self-check.
+    uint8_t* data() noexcept { return mData.data(); }
+    const uint8_t* data() const noexcept { return mData.data(); }
+    // Seed the whole line from a 64 B source (fill).
+    void seedData(const uint8_t* src) noexcept { std::copy(src, src + kMaxLineBytes, mData.begin()); }
 
    private:
     address_t mTag{0};
     address_t mAddress{0};
     bool mValid{false};
     bool mModified{false};
+    std::array<uint8_t, kMaxLineBytes> mData{};
+    bool mPrefetched{false};  // installed by a prefetch, not yet demand-hit
+    bool mUnique{false};      // held exclusive (E or M): writable without asking the next level
 };
 
 // ── CacheSet ──
 
 class CacheSet {
    public:
-    CacheSet(uint32_t numWays, ReplacementPolicy policy)
+    CacheSet(uint32_t numWays, const std::string& policy)
         : mNumWays(numWays) {
         mLines.resize(numWays);
-        mReplacement = createReplacementPolicy(policy, numWays);
+        mReplacement = ReplacementRegistry::instance().create(policy, numWays);
     }
 
     CacheLine* findLine(address_t tag) {
@@ -210,23 +218,28 @@ class SimpleCache {
         uint64_t lineSize{64};
         uint64_t associativity{8};
         std::string replacementPolicy{"lru"};
+        // Parameter names for config errors.
+        std::string sizeParam{"cache_size_kb"}, lineSizeParam{"cache_line_size"}, associativityParam{"cache_associativity"};
     };
 
     explicit SimpleCache(const Config& cfg)
         : mConfig(cfg) {
         uint64_t bytes = cfg.cacheSizeKb * 1024;
-        mNumSets = bytes / (cfg.lineSize * cfg.associativity);
-        sparta_assert(mNumSets > 0, "Invalid cache config: 0 sets");
-        sparta_assert(sparta::utils::is_power_of_2(cfg.lineSize), "lineSize must be power of 2");
+        sparta_assert(cfg.associativity > 0, cfg.associativityParam << " must be nonzero");
+        sparta_assert(sparta::utils::is_power_of_2(cfg.lineSize), cfg.lineSizeParam << " = " << cfg.lineSize << "; must be a power of two");
+        const uint64_t set_bytes = cfg.lineSize * cfg.associativity;
+        sparta_assert(bytes > 0 && bytes % set_bytes == 0, cfg.sizeParam << " = " << cfg.cacheSizeKb << " KiB; must be a nonzero multiple of "
+                                                                         << cfg.lineSizeParam << " x " << cfg.associativityParam << " = " << set_bytes
+                                                                         << " bytes");
+        mNumSets = bytes / set_bytes;
 
         mLineShift = sparta::utils::floor_log2(cfg.lineSize);
         mPow2Sets = sparta::utils::is_power_of_2(mNumSets);
         mSetMask = mPow2Sets ? static_cast<uint32_t>(mNumSets - 1) : 0;
         mSetShift = mPow2Sets ? (mLineShift + sparta::utils::floor_log2(mNumSets)) : mLineShift;
 
-        auto pol = stringToReplacementPolicy(cfg.replacementPolicy);
         mSets.reserve(mNumSets);
-        for (uint32_t i = 0; i < mNumSets; ++i) mSets.emplace_back(cfg.associativity, pol);
+        for (uint32_t i = 0; i < mNumSets; ++i) mSets.emplace_back(cfg.associativity, cfg.replacementPolicy);
     }
 
     bool isHit(address_t addr) const { return peekLine(addr) != nullptr; }

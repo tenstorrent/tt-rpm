@@ -3,53 +3,27 @@
 
 #include "Instruction.hpp"
 
+#include <array>
+#include <string>
 #include <string_view>
 
 namespace cpu {
 
 static InstClass classifyAlu(const WhisperUtil::TraceRecord& rec) {
-    std::string_view name = rec.instructionName();
+    const std::string name = rec.instructionName();  // returned by value
     // Prefix matching also covers the high-half and width variants (mulh, mulw, divuw, remw, etc.)
     if (name.starts_with("mul")) return InstClass::Multiply;
     if (name.starts_with("div") || name.starts_with("rem")) return InstClass::Divide;
     return InstClass::ALU;
 }
 
-static uint8_t latencyForClass(InstClass c) {
-    switch (c) {
-        case InstClass::ALU:
-            return 1;
-        case InstClass::Multiply:
-            return 3;
-        case InstClass::Divide:
-            return 20;
-        case InstClass::Load:
-            return 1;
-        case InstClass::Store:
-            return 1;
-        case InstClass::Branch:
-            return 1;
-        case InstClass::Jump:
-            return 1;
-        case InstClass::Float:
-            return 4;
-        case InstClass::Vector:
-            return 6;
-        case InstClass::Atomic:
-            return 4;
-        case InstClass::Custom:
-            return 1;
-        default:
-            return 1;
-    }
-}
-
 static InstClass classifyFromTraceRecord(const WhisperUtil::TraceRecord& rec) {
     switch (rec.instType) {
         case 'l':
-            return InstClass::Load;
         case 's':
-            return InstClass::Store;
+            // The trace types LR as a load and SC as a store; both are atomics.
+            if (rec.assembly.starts_with("lr.") || rec.assembly.starts_with("sc.")) return InstClass::Atomic;
+            return rec.instType == 'l' ? InstClass::Load : InstClass::Store;
         case 't':
         case 'n':
             return InstClass::Branch;
@@ -68,17 +42,43 @@ static InstClass classifyFromTraceRecord(const WhisperUtil::TraceRecord& rec) {
     }
 }
 
+// vtype is an implicit source of every vector instruction; PerfApi fills its value only at execute.
+static bool vectorSewAtMost32(const TT_PERF::InstrPac* pac) {
+    if (!pac || !pac->executed()) return false;
+    std::array<TT_PERF::Operand, 8> ops;
+    const unsigned count = pac->getImplicitSrcOperands(ops);
+    for (unsigned i = 0; i < count; i++) {
+        if (ops[i].type == WdRiscv::OperandType::CsReg && ops[i].number == static_cast<unsigned>(WdRiscv::CsrNumber::VTYPE)) {
+            return ((ops[i].value.scalar >> 3) & 7) <= 2;  // vsew 0-2 is SEW 8-32
+        }
+    }
+    return false;
+}
+
+static FpDivPrecision classifyFpDiv(const WhisperUtil::TraceRecord& rec, const TT_PERF::InstrPac* pac) {
+    if (rec.instType != 'f' && rec.instType != 'v') return FpDivPrecision::None;
+    const std::string_view assembly = rec.assembly;
+    const std::string_view name = assembly.substr(0, assembly.find(' '));
+    if (name.starts_with("fdiv.") || name.starts_with("fsqrt.")) {
+        return (name.ends_with(".s") || name.ends_with(".h")) ? FpDivPrecision::Single : FpDivPrecision::Double;
+    }
+    if (name.starts_with("vfdiv.") || name.starts_with("vfrdiv.") || name.starts_with("vfsqrt.")) {
+        return vectorSewAtMost32(pac) ? FpDivPrecision::Single : FpDivPrecision::Double;
+    }
+    return FpDivPrecision::None;
+}
+
 Instruction::Instruction(const WhisperUtil::TraceRecord& rec, instid_t id, coreid_t coreId, std::shared_ptr<TT_PERF::InstrPac> pacPtr)
     : TrackedAllocationPerCore<Instruction>(coreId),
       mRecord(rec),
       mId(id),
       mPacPtr(std::move(pacPtr)),
       mInstClass(classifyFromTraceRecord(rec)),
-      mLatency(latencyForClass(mInstClass)) {}
+      mFpDivPrecision(classifyFpDiv(rec, mPacPtr.get())) {}
 
 void Instruction::refreshInstClass() {
     mInstClass = classifyFromTraceRecord(mRecord);
-    mLatency = latencyForClass(mInstClass);
+    mFpDivPrecision = classifyFpDiv(mRecord, mPacPtr.get());
 }
 
 }  // namespace cpu

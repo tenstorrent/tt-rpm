@@ -14,7 +14,7 @@ Given one or more experiment config files and a set of benchmarks, this tool
   5. submits one sbatch array job per (experiment, benchmark) pair.
 
 Run with --dry-run to generate everything but skip sbatch. Run with --blocking
-to wait on the jobs and then auto-invoke parse_slurm_results.py.
+to wait on the jobs and then auto-invoke parse_slurm_results.py and perf_report.py.
 
 Run with --help for all options. See configs/experiment_configs/core_baseline.yml
 for an example experiment config and benchmarks.yml for the benchmark registry.
@@ -42,9 +42,13 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from slurm_utils import (  # noqa: E402
     detect_cluster_name,
     submit_sbatch,
-    task_ids_to_slurm_spec,  # noqa: F401  (kept for downstream/debug use)
     wait_on_job,
 )
+PARSE_SCRIPTS = REPO_ROOT / "scripts" / "parse_scripts"
+sys.path.insert(0, str(PARSE_SCRIPTS))
+from rpmreport.data import write_settings  # noqa: E402
+from rpmreport.metrics import SPEC_SECONDS  # noqa: E402
+from rpmreport.notebook import write_notebook  # noqa: E402
 
 DEFAULT_RESULT_ROOT = "results"
 DEFAULT_QOS = "normal"
@@ -70,9 +74,8 @@ class Experiment:
             raise ValueError("experiment missing 'config_name'")
         if not self.model:
             raise ValueError(f"experiment {self.config_name}: missing 'model'")
-        if self.num_cycles is None and self.num_instructions is None:
-            raise ValueError(
-                f"experiment {self.config_name}: set either num_cycles or num_instructions")
+        # Both optional: when neither is set, run.py emits no -r/-i and the model's
+        # own config governs the run length (e.g. the cluster's `instruction_limit`).
         if self.num_cycles is not None and self.num_instructions is not None:
             raise ValueError(
                 f"experiment {self.config_name}: num_cycles and num_instructions are mutually exclusive")
@@ -81,12 +84,18 @@ class Experiment:
 @dataclasses.dataclass
 class Benchmark:
     name: str
-    type: str               # 'elf'
+    type: str               # 'elf' | 'snapshot'
     path: Path
     workload_files: list[Path]
 
     def model_flag(self) -> str:
-        return "--target-elf"
+        # Everything execution-driven from a snapshot goes through --snapshot. The cluster
+        # infers the Whisper topology from the snapshot's hart count: a multi-hart
+        # snapshot runs one shared Whisper (shared address space); a single-hart
+        # snapshot runs an independent Whisper per core.
+        if self.type == "elf":
+            return "--target-elf"
+        return "--snapshot"
 
 
 # ---------------------------------------------------------------------------
@@ -146,9 +155,10 @@ def load_benchmarks_yaml(registry_path: Path, repo_root: Path) -> dict[str, dict
         spec["path"] = resolved
         spec.setdefault("glob", "*")
         spec.setdefault("type", "elf")
-        if spec["type"] != "elf":
+        if spec["type"] not in ("elf", "trace", "snapshot"):
             raise ValueError(
-                f"benchmark '{name}': type must be 'elf', got {spec['type']!r}")
+                f"benchmark '{name}': type must be 'elf', 'trace', or 'snapshot', "
+                f"got {spec['type']!r}")
     return data
 
 
@@ -177,17 +187,23 @@ def materialize_benchmarks(
 
 
 def materialize_ad_hoc_benchmark(
-    directory: Path, workload_prefixes: Optional[list[str]]
+    kind: str, directory: Path, workload_prefixes: Optional[list[str]]
 ) -> Benchmark:
+    if kind == "elf":
+        patterns = ("*.elf",)
+        bench_name = "elfs"
+    else:
+        patterns = ("*-trace.csv.zst", "*.csv.zst", "*.csv")
+        bench_name = "traces"
     files: list[Path] = []
-    for pat in ("*.elf",):
+    for pat in patterns:
         files.extend(directory.glob(pat))
     files = sorted(set(files))
     if workload_prefixes:
         files = [f for f in files if any(f.name.startswith(p) for p in workload_prefixes)]
     if not files:
-        raise FileNotFoundError(f"no ELF files found under {directory}")
-    return Benchmark(name="elfs", type="elf", path=directory, workload_files=files)
+        raise FileNotFoundError(f"no {kind} files found under {directory}")
+    return Benchmark(name=bench_name, type=kind, path=directory, workload_files=files)
 
 
 # ---------------------------------------------------------------------------
@@ -199,98 +215,54 @@ def build_result_dir(args, study_name: str) -> Path:
         base = Path(args.result_dir).expanduser().resolve()
     else:
         user = getpass.getuser() or "unknown"
-        base = Path(args.result_root).expanduser() / "experiments" / user / study_name
+        root = Path(args.result_root).expanduser()
+        if not root.is_absolute():
+            root = REPO_ROOT / root  # relative result-root is relative to the repo
+        base = (root / "experiments" / user / study_name).resolve()
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     return base / f"{study_name}_{ts}"
 
 
+def find_model_binary(repo_root: Path, model: str) -> Path:
+    """Locate a built model binary. Single-core lands at build/<model>/<model>;
+    the cluster (a `top` composite) lands at build/top/<model>/<model>."""
+    candidates = [
+        repo_root / "build" / model / model,
+        repo_root / "build" / "top" / model / model,
+    ]
+    for src in candidates:
+        if src.is_file() and os.access(src, os.X_OK):
+            return src
+    raise FileNotFoundError(
+        f"model binary '{model}' not found/executable in any of "
+        f"{[str(c) for c in candidates]} "
+        f"(run scripts/build_scripts/build_model.sh --model {model} first)")
+
+
 def snapshot_binary(repo_root: Path, model: str, dest: Path) -> Path:
-    src_binary = repo_root / "build" / model / model
-    src_config = repo_root / "build" / model / "config.yaml"
-    if not src_binary.is_file() or not os.access(src_binary, os.X_OK):
-        raise FileNotFoundError(
-            f"model binary not found or not executable at {src_binary} "
-            f"(run scripts/build_scripts/build_model.sh --model {model} first)")
+    src_binary = find_model_binary(repo_root, model)
     dest.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src_binary, dest / model)
     (dest / model).chmod(0o755)
-    if src_config.is_file():
-        shutil.copy2(src_config, dest / "config.yaml")
+    # Copy the binary's sibling config files so the run is self-contained. The
+    # single-core model reads config.yaml; the cluster additionally reads its
+    # core_config.yaml (referenced from config.yaml) and whisper.json. Grab every
+    # .yaml/.json alongside the binary, skipping editor/backup/crash artifacts.
+    for sib in sorted(src_binary.parent.iterdir()):
+        if sib.suffix in (".yaml", ".json") and not sib.name.endswith(".bak"):
+            shutil.copy2(sib, dest / sib.name)
     return dest
 
 
-# ---------------------------------------------------------------------------
-# performance-study notebook + report
-# ---------------------------------------------------------------------------
-
-NOTEBOOK_SRC = REPO_ROOT / "scripts" / "parse_scripts" / "notebook"
-NOTEBOOK_TEMPLATE = NOTEBOOK_SRC / "performance_study_notebook.ipynb"
-# study_report.py is both the analysis library and the report CLI; it carries
-# the study placeholders, so it is templated rather than copied verbatim.
-REPORT_SCRIPT = "study_report.py"
-# Low-level parser library copied verbatim into each study root.
-PARSER_PACKAGE = ("json_stats_parsing.py", "common.py", "core_profiles.py")
-
-
-def _substitute_study_params(
-    text: str, study_name: str, base_exp_name: str,
-    metadata_file: Optional[Path], core: str = "rpm",
-) -> str:
-    """Fill the shared notebook/report placeholders."""
-    text = text.replace("$base_exp_name", base_exp_name or "")
-    text = text.replace("$path_to_metadata_file/metadata.yml",
-                        str(metadata_file) if metadata_file else "")
-    text = text.replace("$core", core or "rpm")
-    return text.replace("<NAME>", study_name)
-
-
-def instantiate_notebook(
-    study_dir: Path, study_name: str,
-    base_exp_name: str, metadata_file: Optional[Path], core: str = "rpm",
-) -> None:
-    """Copy the parser library into the study dir and drop the study tools.
-
-    Both the notebook and ``study_report.py`` (run as the report CLI) parse
-    `os.getcwd()`, so they must live alongside the parser library in the study
-    root. study_report.py carries the study placeholders (score reference +
-    metadata path), so it is templated rather than copied verbatim.
-    """
-    for item in PARSER_PACKAGE:
-        src = NOTEBOOK_SRC / item
-        if src.is_file():
-            shutil.copy2(src, study_dir / item)
-
-    report_src = NOTEBOOK_SRC / REPORT_SCRIPT
-    if report_src.is_file():
-        text = _substitute_study_params(
-            report_src.read_text(), study_name, base_exp_name, metadata_file, core)
-        out = study_dir / REPORT_SCRIPT
-        out.write_text(text)
-        out.chmod(0o755)
-        print(f"  report library/CLI: {out}")
-
-    if not NOTEBOOK_TEMPLATE.is_file():
-        print(f"  [notebook] template missing at {NOTEBOOK_TEMPLATE}; skipping",
-              file=sys.stderr)
-        return
-    text = _substitute_study_params(
-        NOTEBOOK_TEMPLATE.read_text(), study_name, base_exp_name, metadata_file, core)
-    out = study_dir / f"{study_name}_performance_study.ipynb"
-    out.write_text(text)
-    print(f"  notebook: {out}")
-
-
-def generate_html_report(study_dir: Path) -> int:
-    """Run the study's study_report.py CLI to emit performance_report.html."""
-    report_script = study_dir / REPORT_SCRIPT
-    if not report_script.is_file():
-        print(f"  [report] {REPORT_SCRIPT} missing; skipping", file=sys.stderr)
-        return 0
-    print("generating HTML report")
-    rc = subprocess.call([sys.executable, str(report_script)], cwd=str(study_dir))
-    if rc != 0:
-        print(f"  [report] {REPORT_SCRIPT} exited {rc}", file=sys.stderr)
-    return rc
+def instruction_count_files(args, benchmarks: list[Benchmark]) -> list[Path]:
+    """--metadata-file, else any count file found beside the workload set."""
+    if args.metadata_file:
+        missing = [str(p) for p in args.metadata_file if not p.is_file()]
+        if missing:
+            raise SystemExit(f"error: --metadata-file not found: {', '.join(missing)}")
+        return [p.resolve() for p in args.metadata_file]
+    found = {w.parent.parent / "metadata.yml" for b in benchmarks for w in b.workload_files}
+    return sorted(p.resolve() for p in found if p.is_file())
 
 
 # ---------------------------------------------------------------------------
@@ -328,21 +300,23 @@ def wrap_task_cmd(
     """Wrap the model invocation with /usr/bin/time, size cap, and bz2 log.
 
     The raw JSON the model writes to `stats_json` is bzip2'd to
-    `<stats_json>.bz2` after the run.
+    `<stats_json>.bz2` after the run. The task exits with the model's status.
+    Past the cap the log is drained, not closed: closing it kills the model with SIGPIPE.
     """
     run = f"cd {shlex.quote(str(binary_dir))} && {inner_cmd}"
     sj = shlex.quote(str(stats_json))
     return (
         f"/usr/bin/time -v bash -o pipefail -c {shlex.quote(run)} "
-        f"2>&1 | head --bytes={max_log_bytes} | bzip2 > {shlex.quote(str(log_path))}; "
-        f"bzip2 -f {sj}"
+        f"2>&1 | {{ head --bytes={max_log_bytes}; cat > /dev/null; }} "
+        f"| bzip2 > {shlex.quote(str(log_path))}; "
+        f"rc=${{PIPESTATUS[0]}}; bzip2 -f {sj}; exit $rc"
     )
 
 
 def workload_base(workload: Path) -> str:
     base = workload.name
-    # strip the .elf extension to form the workload's base name
-    for suffix in (".elf",):
+    # drop obvious trace extensions but keep ELFs intact
+    for suffix in (".csv.zst", ".csv", ".elf"):
         if base.endswith(suffix):
             base = base[: -len(suffix)]
             break
@@ -387,6 +361,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="Path to benchmarks.yml (default: alongside run.py)")
     p.add_argument("--elf-dir", type=Path, default=None,
                    help="Ad-hoc sweep of ELFs in a directory (skips benchmarks.yml)")
+    p.add_argument("--trace-dir", type=Path, default=None,
+                   help="Ad-hoc sweep of traces in a directory (skips benchmarks.yml)")
     p.add_argument("--benches", default=None,
                    help="Comma-separated workload-name prefixes to filter within a benchmark")
     p.add_argument("--mem-per-slot", type=float, default=DEFAULT_MEM_PER_SLOT_GB,
@@ -397,23 +373,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="Slurm partition to submit to")
     p.add_argument("--qos", default=DEFAULT_QOS,
                    help="Slurm QOS (default: %(default)s)")
-    p.add_argument("--slurmtest", action="store_true",
-                   help="Submit to the <partition>-test queue")
     p.add_argument("--cluster", default=None,
                    help="Slurm cluster name (default: auto-detected via scontrol)")
     p.add_argument("--max-log-bytes", default=DEFAULT_MAX_LOG_BYTES,
                    help="Cap on per-task log bytes before bzip2 (default: %(default)s)")
-    p.add_argument("--score-ref", default="",
-                   help="Score reference table for the study notebook (e.g. 'spec2006'); "
-                        "empty auto-detects the suite from the benchmark names / "
-                        "metadata path, falling back to IPC-only")
-    p.add_argument("--metadata-file", type=Path, default=None,
-                   help="metadata.yml with Dynamic-Insts for the notebook "
-                        "(auto-detected from the workload directory when omitted)")
-    p.add_argument("--core", default="rpm",
-                   help="Core profile selecting the counter map for the study "
-                        "notebook/report (e.g. rpm); "
-                        "default: %(default)s")
+    p.add_argument("--score-ref", default=None, choices=sorted(SPEC_SECONDS),
+                   help="SPEC suite the report scores against (default: auto-detect)")
+    p.add_argument("--metadata-file", action="append", type=Path,
+                   help="Per-input dynamic instruction counts (YAML) for report scores; repeatable")
     p.add_argument("--result-root", default=DEFAULT_RESULT_ROOT,
                    help="Base directory for default --result-dir")
     p.add_argument("--result-dir", type=Path, default=None,
@@ -421,7 +388,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true",
                    help="Generate the study dir + scripts but skip sbatch")
     p.add_argument("--blocking", action="store_true",
-                   help="Wait for submitted jobs, then run parse_slurm_results.py")
+                   help="Wait for submitted jobs, then run parse_slurm_results.py and perf_report.py")
     return p.parse_args(argv)
 
 
@@ -429,25 +396,28 @@ def select_benchmarks(args: argparse.Namespace) -> list[Benchmark]:
     prefixes = [s.strip() for s in args.benches.split(",")] if args.benches else None
     ad_hoc: list[Benchmark] = []
     if args.elf_dir:
-        ad_hoc.append(materialize_ad_hoc_benchmark(args.elf_dir.resolve(), prefixes))
+        ad_hoc.append(materialize_ad_hoc_benchmark("elf", args.elf_dir.resolve(), prefixes))
+    if args.trace_dir:
+        ad_hoc.append(materialize_ad_hoc_benchmark("trace", args.trace_dir.resolve(), prefixes))
     if args.benchmarks:
         names = [s.strip() for s in args.benchmarks.split(",") if s.strip()]
         registry = load_benchmarks_yaml(args.benchmarks_yml, REPO_ROOT)
         ad_hoc.extend(materialize_benchmarks(registry, names, prefixes))
     if not ad_hoc:
         raise SystemExit(
-            "error: pick workloads via --benchmarks NAME[,NAME...] or --elf-dir DIR")
+            "error: pick workloads via --benchmarks NAME[,NAME...], --elf-dir DIR, or --trace-dir DIR")
     return ad_hoc
 
 
 def main(argv: list[str]) -> int:
+    sys.stdout.reconfigure(line_buffering=True)  # --blocking is usually backgrounded into a log
     args = parse_args(argv)
 
-    cluster = args.cluster or detect_cluster_name()
-    partition = f"{args.partition}-test" if args.slurmtest else args.partition
+    cluster = args.cluster or ("DRY-RUN" if args.dry_run else detect_cluster_name())
 
     experiments = load_experiment_configs(args.configs)
     benchmarks = select_benchmarks(args)
+    counts = instruction_count_files(args, benchmarks)
 
     study_dir = build_result_dir(args, args.study_name)
     study_dir.mkdir(parents=True, exist_ok=True)
@@ -457,15 +427,8 @@ def main(argv: list[str]) -> int:
     for cfg in args.configs:
         shutil.copy2(cfg, study_dir / cfg.name)
 
-    # Drop a ready-to-run performance-study notebook into the study root.
-    # With no explicit --metadata-file, leave the path empty: study_report.py
-    # (and the notebook) derive the metadata.yml(s) from the study's own
-    # workload paths, which covers studies spanning several workload sets (a
-    # single pinned file would only score one suite and break the others).
-    metadata_file = args.metadata_file
-    if args.metadata_file and not args.metadata_file.is_file():
-        print(f"warning: --metadata-file {args.metadata_file} not found", file=sys.stderr)
-    instantiate_notebook(study_dir, args.study_name, args.score_ref, metadata_file, args.core)
+    write_settings(study_dir, args.study_name, args.score_ref, counts)
+    write_notebook(study_dir, args.study_name, args.score_ref, counts, REPO_ROOT)
 
     # Snapshot each distinct model binary into the study dir.
     binary_dirs: dict[str, Path] = {}
@@ -483,9 +446,12 @@ def main(argv: list[str]) -> int:
         exp_dir = study_dir / exp.config_name
         exp_binary_dir = exp_dir / "binary"
         exp_binary_dir.mkdir(parents=True, exist_ok=True)
-        # Per-experiment binary copy so each run is fully self-contained.
+        # Per-experiment binary so each run is self-contained; hardlinked, the model is ~200 MB.
         for item in binary_dirs[exp.model].iterdir():
-            shutil.copy2(item, exp_binary_dir / item.name)
+            try:
+                os.link(item, exp_binary_dir / item.name)
+            except OSError:
+                shutil.copy2(item, exp_binary_dir / item.name)
             if item.name == exp.model:
                 (exp_binary_dir / item.name).chmod(0o755)
 
@@ -507,7 +473,7 @@ def main(argv: list[str]) -> int:
 
             comment = f"{args.study_name}_{exp.config_name}_{bench.name}"
             sbatch_args = [
-                "-p", partition,
+                "-p", args.partition,
                 "--qos", args.qos,
                 "--cpus-per-task=1",
                 f"--mem-per-cpu={mem_mb}M",
@@ -540,13 +506,15 @@ def main(argv: list[str]) -> int:
         if rc != 0:
             print(f"parse_slurm_results.py exited {rc}", file=sys.stderr)
             return rc
-        generate_html_report(study_dir)
-        print(f"report: {study_dir / 'performance_report.html'}")
+        rc = subprocess.call([sys.executable, str(PARSE_SCRIPTS / "perf_report.py"), str(study_dir)])
+        if rc != 0:
+            print(f"perf_report.py exited {rc}", file=sys.stderr)
+            return rc
     else:
         print(f"results will land in {study_dir}")
         print("when jobs complete, run:")
         print(f"  {REPO_ROOT}/scripts/parse_scripts/parse_slurm_results.py {study_dir}")
-        print(f"  (cd {study_dir} && python {REPORT_SCRIPT})   # -> performance_report.html")
+        print(f"  {PARSE_SCRIPTS}/perf_report.py {study_dir}")
     return 0
 
 

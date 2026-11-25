@@ -38,9 +38,10 @@ set(COMMON_HEADERS
     Common/PipelinePacket.hpp
     Common/PipelineVisualizer.hpp
     Common/WritePortArbiter.hpp
-    Common/BypassNetwork.hpp
+    Common/FpOpClass.hpp
     Common/WritebackBuffer.hpp
     Common/FlushArbiter.hpp
+    Common/PrefetchHost.hpp
     Common/CheckpointManager.hpp
     Common/SpeculationConfig.hpp
     Common/SpeculationUtils.hpp
@@ -48,17 +49,23 @@ set(COMMON_HEADERS
     MemoryHierarchy/CacheInterface.hpp
     MemoryHierarchy/CacheTracer.hpp
     MemoryHierarchy/L2Cache.hpp
+    MemoryHierarchy/Dram/MemoryBackend.hpp
+    MemoryHierarchy/Dram/DramController.hpp
+    MemoryHierarchy/Dram/Dram.hpp
 )
 
 set(COMMON_SOURCES
     Common/PipelineVisualizer.cpp
     Common/WritePortArbiter.cpp
-    Common/BypassNetwork.cpp
     Common/WritebackBuffer.cpp
     Common/FlushArbiter.cpp
+    Common/PrefetchHost.cpp
     MemoryHierarchy/CacheInterface.cpp
     MemoryHierarchy/CacheTracer.cpp
     MemoryHierarchy/L2Cache.cpp
+    MemoryHierarchy/Replacement.cpp
+    MemoryHierarchy/Dram/DramController.cpp
+    MemoryHierarchy/Dram/Dram.cpp
 )
 
 # Pipeline clock
@@ -81,6 +88,8 @@ set(FRONTEND_SOURCES
     Frontend/DecodeQueue/DecodeQueue.hpp
     Frontend/BranchPredictor/BranchPredictor.cpp
     Frontend/BranchPredictor/BranchPredictor.hpp
+    Frontend/BranchPredictor/TargetPredictor.cpp
+    Frontend/BranchPredictor/TargetPredictor.hpp
 )
 
 # Midcore source files
@@ -98,6 +107,8 @@ set(MIDCORE_SOURCES
     LoadStoreUnit/LSQ/LSQ.hpp
     LoadStoreUnit/BackendMemoryStructures/BackendMemoryStructures.cpp
     LoadStoreUnit/BackendMemoryStructures/BackendMemoryStructures.hpp
+    Mmu/Mmu.cpp
+    Mmu/Mmu.hpp
     Midcore/Writeback/Writeback.cpp
     Midcore/Writeback/Writeback.hpp
 )
@@ -109,11 +120,33 @@ set(RPM_COMMON_SOURCES
     ${RPM_ROOT}/models/cpu/common/SnapshotUtil.cpp
 )
 
+# Accelerator device sources (interfaces are header-only; see models/cpu/accel). Compiled
+# here to prove the interface builds in the core include root.
+set(ACCEL_SOURCES
+    ${RPM_ROOT}/models/cpu/accel/devices/DmaEngine.cpp
+)
+
+include(${RPM_ROOT}/models/cpu/predictors/predictors.cmake)
+
+# TLB algorithm sources (the interface is header-only).
+set(TLB_SOURCES
+    ${RPM_ROOT}/models/cpu/tlb/src/SetAssocTlb.cpp
+)
+
+# Prefetcher algorithm sources (interfaces are header-only).
+set(PREFETCH_SOURCES
+    ${RPM_ROOT}/models/cpu/prefetch/algorithms/src/IpStride.cpp
+    ${RPM_ROOT}/models/cpu/prefetch/algorithms/src/NextLine.cpp
+    ${RPM_ROOT}/models/cpu/prefetch/algorithms/src/Stream.cpp
+)
+
 # Main executable
 add_executable(core
     Common/main.cpp
     Common/ChipSim.cpp
     Common/ChipSim.hpp
+    Common/CoreImpl.cpp
+    Common/CoreImpl.hpp
     Common/Core.cpp
     Common/Core.hpp
     ${COMMON_HEADERS}
@@ -122,11 +155,16 @@ add_executable(core
     ${FRONTEND_SOURCES}
     ${MIDCORE_SOURCES}
     ${RPM_COMMON_SOURCES}
+    ${ACCEL_SOURCES}
+    ${PREDICTOR_SOURCES}
+    ${TLB_SOURCES}
+    ${PREFETCH_SOURCES}
 )
 
 # Own source include directories
 target_include_directories(core PRIVATE
     ${RPM_ROOT}
+    ${RPM_ROOT}/models/cpu
     ${RPM_ROOT}/models/cpu/common
     ${CMAKE_CURRENT_SOURCE_DIR}
 )

@@ -22,7 +22,7 @@ class DecodeQueueParams : public sparta::ParameterSet {
         : sparta::ParameterSet(n) {}
 
     PARAMETER(uint32_t, capacity, 32, "DecodeQueue capacity (entries)")
-    PARAMETER(bool, log_enabled, false, "Enable debug logging for this unit")
+    PARAMETER(uint32_t, latency, 1, "Extra rename stages between Decode and Rename (0 = Rename takes a uop the cycle after Decode)")
 };
 
 class DecodeQueue : public sparta::Unit {
@@ -39,10 +39,11 @@ class DecodeQueue : public sparta::Unit {
     void tick();
 
     // Pull model: Rename calls these methods
-    const core::DecodePacket* peek() const { return mQueue.empty() ? nullptr : &mQueue.front(); }
+    const core::DecodePacket* peek() const { return hasReady() ? &mQueue.front().dp : nullptr; }
     core::DecodePacket pullOne();  // Pull single packet from head
 
-    bool isEmpty() const { return mQueue.empty(); }
+    // The head has cleared the decode-to-rename latency.
+    bool hasReady() const { return !mQueue.empty() && mQueue.front().ready_cycle <= getClock()->currentCycle(); }
     bool isReady() const { return mQueue.size() < mCapacity; }
     size_t available() const { return mCapacity - mQueue.size(); }
     size_t size() const { return mQueue.size(); }
@@ -52,20 +53,26 @@ class DecodeQueue : public sparta::Unit {
     uint64_t numEnqueued() const { return mNumEnqueued.get(); }
     uint64_t numDequeued() const { return mNumDequeued.get(); }
     uint64_t numFullStallCycles() const { return mNumFullStallCycles.get(); }
+    uint64_t numLatencyWaitCycles() const { return mNumLatencyWaitCycles.get(); }
 
    private:
     void receiveDecodePackets_(const std::vector<core::DecodePacket>& pkts);
     void receiveFlush_(const core::FlushRequest& req);
 
-    std::deque<core::DecodePacket> mQueue;
+    struct Entry {
+        core::DecodePacket dp;
+        uint64_t ready_cycle{0};
+    };
+    std::deque<Entry> mQueue;
 
     uint32_t mCapacity;
+    uint32_t mLatency;
     core::PipelineVisualizer* mVis{nullptr};
-    bool mLogEnabled{false};
 
     sparta::Counter mNumEnqueued;
     sparta::Counter mNumDequeued;
     sparta::Counter mNumFullStallCycles;
+    sparta::Counter mNumLatencyWaitCycles;
 };
 
 }  // namespace frontend

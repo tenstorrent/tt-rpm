@@ -55,7 +55,9 @@ if(RPM_CPU_COMMON_SOURCES)
     if(NOT APPLE)
         target_link_libraries(rpm_cpu_common PUBLIC rt)
     endif()
-    target_compile_options(rpm_cpu_common PRIVATE -Wall -Wextra -Wpedantic)
+    # -Ulinux: whisper's Args.hpp uses 'linux' as a variable name, which clashes
+    # with the GNU predefined 'linux' macro under -std=gnu++23.
+    target_compile_options(rpm_cpu_common PRIVATE -Wall -Wextra -Wpedantic -Ulinux)
 endif()
 
 # ---------- Model targets ----------
@@ -76,3 +78,15 @@ foreach(model ${RPM_MODELS})
         message(STATUS "Skipping model: ${model} (no CMakeLists.txt)")
     endif()
 endforeach()
+
+# ---------- Cluster-level models ----------
+if(EXISTS "${RPM_ROOT}/models/cluster/src/CMakeLists.txt")
+    message(STATUS "Adding model: cluster")
+    add_subdirectory("${RPM_ROOT}/models/cluster/src" "${CMAKE_BINARY_DIR}/cluster")
+endif()
+
+# ---------- Accelerator interface (common interface + devices + harness) ----------
+if(EXISTS "${RPM_ROOT}/models/cpu/accel/CMakeLists.txt")
+    message(STATUS "Adding model: accel")
+    add_subdirectory("${RPM_ROOT}/models/cpu/accel" "${CMAKE_BINARY_DIR}/accel")
+endif()

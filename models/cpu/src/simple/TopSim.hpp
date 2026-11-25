@@ -3,8 +3,13 @@
 
 #pragma once
 
+#include <memory>
+#include <string>
+#include <vector>
+
 #include "sparta/app/Simulation.hpp"
 #include "sparta/kernel/Scheduler.hpp"
+#include "sparta/simulation/Unit.hpp"
 
 class FetchUnit;
 
@@ -14,7 +19,8 @@ class ExecutionDriver;
 
 class TopSim : public sparta::app::Simulation {
    public:
-    TopSim(sparta::Scheduler* sched);
+    TopSim(sparta::Scheduler* sched, const std::string& target_elf = "");
+    ~TopSim() override;
 
     void run(uint64_t run_time) override;
 
@@ -26,4 +32,6 @@ class TopSim : public sparta::app::Simulation {
    private:
     FetchUnit* mFetch = nullptr;
     cpu::ExecutionDriver* mExecutionDriver = nullptr;
+    std::string mTargetElf;  // overrides config.yaml target_command when set
+    std::vector<std::unique_ptr<sparta::Unit>> mUnits;
 };

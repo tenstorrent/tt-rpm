@@ -17,14 +17,14 @@ static const char* USAGE =
     "  -c CONFIG.yaml  Load Sparta config file\n"
     "  -p PATH VALUE   Override a parameter\n"
     "  --show-tree     Print the device tree\n"
-    "  --trace-file F  Trace file (csv.zst) for trace-driven mode\n"
+    "  --snapshot F    Whisper snapshot directory; runs execution-driven\n"
     "  --target-elf F  ELF binary path\n"
     "\n"
     "Legacy positional syntax also supported:\n"
-    "  core [num_ticks] [trace_file | elf_path]\n";
+    "  core [num_ticks] [snapshot | elf_path]\n";
 
 namespace {
-bool looksLikeTrace(const std::string& s) {
+bool looksLikeSnapshot(const std::string& s) {
     if (s.empty()) return false;
     if (s.find("-trace") != std::string::npos) return true;
     if (s.find("-snap") != std::string::npos) return true;
@@ -42,8 +42,8 @@ bool looksLikeNumber(const std::string& s) {
 
 int main(int argc, char** argv) {
     // Detect legacy positional args and convert to Sparta flags.
-    // Legacy: ./core [num_cycles] [trace_file | elf_path]
-    // Converted: ./core -r num_cycles --trace-file trace_file  (etc.)
+    // Legacy: ./core [num_cycles] [snapshot | elf_path]
+    // Converted: ./core -r num_cycles --snapshot <path>  (etc.)
     std::vector<std::string> new_args;
     new_args.push_back(argv[0]);
 
@@ -65,8 +65,8 @@ int main(int argc, char** argv) {
         }
         if (pos < argc) {
             std::string arg(argv[pos]);
-            if (looksLikeTrace(arg)) {
-                new_args.push_back("--trace-file");
+            if (looksLikeSnapshot(arg)) {
+                new_args.push_back("--snapshot");
             } else {
                 new_args.push_back("--target-elf");
             }
@@ -89,13 +89,13 @@ int main(int argc, char** argv) {
         sparta::app::DefaultValues DEFAULTS;
         sparta::app::CommandLineSimulator cls(USAGE, DEFAULTS);
 
-        std::string trace_file;
+        std::string snapshot;
         std::string target_elf;
         uint64_t instruction_limit = 0;
         double cpu_freq = 3.0;
 
         auto& app_opts = cls.getApplicationOptions();
-        app_opts.add_options()("trace-file", sparta::app::named_value<std::string>("FILE", &trace_file), "Trace file for trace-driven mode")(
+        app_opts.add_options()("snapshot", sparta::app::named_value<std::string>("FILE", &snapshot), "Whisper snapshot directory; runs execution-driven")(
             "target-elf", sparta::app::named_value<std::string>("FILE", &target_elf), "ELF binary path")(
             "instruction-limit,i", sparta::app::named_value<uint64_t>("INSTRS", &instruction_limit)->default_value(0),
             "Stop after retiring this many instructions. 0 (default) means no limit.")(
@@ -109,8 +109,8 @@ int main(int argc, char** argv) {
         sparta::Scheduler scheduler;
         ChipSim sim(&scheduler);
 
-        if (!trace_file.empty())
-            sim.setTraceFilenameOverride(trace_file);
+        if (!snapshot.empty())
+            sim.setSnapshotOverride(snapshot);
         else if (!target_elf.empty())
             sim.setTargetCommandOverride(target_elf);
         if (instruction_limit > 0) sim.setInstructionLimit(instruction_limit);

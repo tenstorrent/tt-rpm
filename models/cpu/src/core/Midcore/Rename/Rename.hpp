@@ -17,6 +17,7 @@
 #include "Common/CheckpointManager.hpp"
 #include "Common/PipelinePacket.hpp"
 #include "Common/PipelineVisualizer.hpp"
+#include "Common/SpeculationConfig.hpp"
 
 namespace midcore {
 
@@ -42,25 +43,21 @@ class PhysicalRegisterFile {
     struct BankConfig {
         uint32_t num_banks{1};
         uint32_t reads_per_bank{8};
-        uint32_t writes_per_bank{4};
         bool enabled{false};
     };
 
     struct Bank {
         uint32_t reads_used{0};
-        uint32_t writes_used{0};
         uint32_t reads_per_cycle{8};
-        uint32_t writes_per_cycle{4};
 
-        bool canRead() const { return reads_used < reads_per_cycle; }
-        bool canWrite() const { return writes_used < writes_per_cycle; }
-        void consumeRead() { ++reads_used; }
-        void consumeWrite() { ++writes_used; }
-        void reset() { reads_used = writes_used = 0; }
+        void reset() { reads_used = 0; }
     };
 
     PhysicalRegisterFile(uint32_t num_physical_registers, uint16_t headroom = 4)
         : mHeadroom(headroom) {
+        // Register numbers and free counts are uint16_t, and the first 32 hold architectural state.
+        sparta_assert(num_physical_registers > 32 && num_physical_registers <= 65536,
+                      "rename.params.num_phys_regs must be in (32, 65536], got " << num_physical_registers);
         for (size_t t = 0; t < kNumRegTypes; ++t) {
             mMappings[t].fill({0, 0});
             for (uint32_t i = 0; i < 32; ++i) {
@@ -74,12 +71,14 @@ class PhysicalRegisterFile {
     }
 
     void configureBanking(const BankConfig& cfg) {
+        sparta_assert(cfg.num_banks >= 1 && cfg.num_banks <= kMaxBanks,
+                      "rename.params.regfile_num_banks must be in [1, " << kMaxBanks << "], got " << cfg.num_banks);
+        sparta_assert(cfg.reads_per_bank >= 1, "rename.params.regfile_reads_per_bank must be at least 1");
         mBankConfig = cfg;
-        if (cfg.enabled && cfg.num_banks > 0) {
+        if (cfg.enabled) {
             mBanks.resize(cfg.num_banks);
             for (auto& b : mBanks) {
                 b.reads_per_cycle = cfg.reads_per_bank;
-                b.writes_per_cycle = cfg.writes_per_bank;
             }
         }
     }
@@ -101,7 +100,7 @@ class PhysicalRegisterFile {
 
         // Check if all banks can handle the reads
         for (size_t i = 0; i < mBanks.size(); ++i) {
-            if (mBanks[i].reads_used + bank_reads[i] > mBanks[i].reads_per_cycle) {
+            if (mBanks[i].reads_used + capReads(i, bank_reads[i]) > mBanks[i].reads_per_cycle) {
                 return false;
             }
         }
@@ -110,32 +109,12 @@ class PhysicalRegisterFile {
 
     void consumeReads(const std::vector<core::PhysRegRef>& regs) {
         if (!mBankConfig.enabled || mBanks.empty()) return;
+        std::array<uint32_t, kMaxBanks> bank_reads{};
         for (const auto& r : regs) {
-            mBanks[bankFor(r.phys_reg)].consumeRead();
+            ++bank_reads[bankFor(r.phys_reg)];
         }
-    }
-
-    bool canWriteRegs(const std::vector<core::PhysRegRef>& regs) const {
-        if (!mBankConfig.enabled || mBanks.empty()) return true;
-
-        std::array<uint32_t, kMaxBanks> bank_writes{};
-        for (const auto& r : regs) {
-            uint32_t bank = bankFor(r.phys_reg);
-            ++bank_writes[bank];
-        }
-
         for (size_t i = 0; i < mBanks.size(); ++i) {
-            if (mBanks[i].writes_used + bank_writes[i] > mBanks[i].writes_per_cycle) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    void consumeWrites(const std::vector<core::PhysRegRef>& regs) {
-        if (!mBankConfig.enabled || mBanks.empty()) return;
-        for (const auto& r : regs) {
-            mBanks[bankFor(r.phys_reg)].consumeWrite();
+            mBanks[i].reads_used += capReads(i, bank_reads[i]);
         }
     }
 
@@ -203,6 +182,10 @@ class PhysicalRegisterFile {
     }
 
    private:
+    // A uop with more same-bank sources than the bank has ports issues when the bank is idle and takes
+    // every port; the extra read cycles are not modelled.
+    uint32_t capReads(size_t bank, uint32_t reads) const { return std::min(reads, mBanks[bank].reads_per_cycle); }
+
     BankConfig mBankConfig;
     std::vector<Bank> mBanks;
 };
@@ -217,12 +200,22 @@ class ArchitecturalScoreboard {
     static size_t idx(core::RegType t) { return core::regTypeIndex(t); }
 
     std::array<std::array<uint64_t, 32>, kNumRegTypes> mWriterTag{};
+    // While busy, the first cycle a consumer may dispatch and meet the writer's result on the bypass.
+    std::array<std::array<uint64_t, 32>, kNumRegTypes> mReadyCycle{};
 
    public:
-    void markBusy(uint8_t arch_reg, core::RegType type, uint64_t tag) {
+    static constexpr uint64_t kNever = UINT64_MAX;
+
+    void markBusy(uint8_t arch_reg, core::RegType type, uint64_t tag, uint64_t ready_cycle) {
         if (type == core::RegType::Int && arch_reg == 0) return;
         assert(arch_reg < 32 && "markBusy: register index out of bounds");
         mWriterTag[idx(type)][arch_reg] = tag + 1;
+        mReadyCycle[idx(type)][arch_reg] = ready_cycle;
+    }
+
+    void readyAt(uint8_t arch_reg, core::RegType type, uint64_t tag, uint64_t cycle) {
+        assert(arch_reg < 32 && "readyAt: register index out of bounds");
+        if (mWriterTag[idx(type)][arch_reg] == tag + 1) mReadyCycle[idx(type)][arch_reg] = std::min(mReadyCycle[idx(type)][arch_reg], cycle);
     }
 
     void clearReg(uint8_t arch_reg, core::RegType type, uint64_t tag) {
@@ -230,13 +223,21 @@ class ArchitecturalScoreboard {
         if (mWriterTag[idx(type)][arch_reg] == tag + 1) mWriterTag[idx(type)][arch_reg] = 0;
     }
 
-    bool sourcesReady(const std::vector<core::RegOperand>& srcs) const {
+    bool sourcesReady(const std::vector<core::RegOperand>& srcs, uint64_t cycle) const {
         for (const auto& src : srcs) {
             if (!core::isRegFileType(src.type)) continue;
             assert(src.number < 32 && "sourcesReady: register index out of bounds");
-            if (mWriterTag[idx(src.type)][src.number] != 0) return false;
+            if (mWriterTag[idx(src.type)][src.number] != 0 && mReadyCycle[idx(src.type)][src.number] > cycle) return false;
         }
         return true;
+    }
+
+    // Clear busy bits left by squashed writers (writer tag > branch_tag) so a flush
+    // doesn't deadlock dispatch. In-order counterpart of the RAT walk-back. (0 == free.)
+    void restoreToTag(uint64_t branch_tag) {
+        for (auto& per_type : mWriterTag)
+            for (auto& w : per_type)
+                if (w != 0 && w > branch_tag + 1) w = 0;
     }
 };
 
@@ -260,13 +261,10 @@ class RenameParams : public sparta::ParameterSet {
     PARAMETER(uint32_t, dispatch_width, 4, "Max instructions renamed/dispatched per cycle")
     PARAMETER(uint32_t, num_phys_regs, 128, "Number of physical registers per type")
     PARAMETER(uint16_t, freelist_headroom, 8, "Min free regs before stalling dispatch")
-    PARAMETER(bool, ooo_enabled, true, "Out-of-order rename/dispatch enabled")
     PARAMETER(bool, regfile_banking_enabled, false, "Enable register file banking")
     PARAMETER(uint32_t, regfile_num_banks, 4, "Number of register file banks")
     PARAMETER(uint32_t, regfile_reads_per_bank, 2, "Read ports per bank per cycle")
-    PARAMETER(uint32_t, regfile_writes_per_bank, 1, "Write ports per bank per cycle")
-    PARAMETER(uint32_t, max_branch_checkpoints, 32, "Max in-flight branch checkpoints")
-    PARAMETER(bool, log_enabled, false, "Enable debug logging for this unit")
+    PARAMETER(uint32_t, max_branch_checkpoints, 20, "Max in-flight branch checkpoints")
 };
 
 class Rename : public sparta::Unit {
@@ -302,6 +300,10 @@ class Rename : public sparta::Unit {
     size_t available() const { return mDispatchWidth - mPendingPackets.size(); }
     void setDecodeQueue(frontend::DecodeQueue* dq) { mDecodeQueue = dq; }
     void setDownstream(midcore::Issue* issue) { mDownstream = issue; }
+    void setSpeculationConfig(const core::SpeculationConfig* cfg) {
+        sparta_assert(!cfg->enabled || mCheckpointMgr.capacity() > 0, "rename.params.max_branch_checkpoints must be at least 1 with wrong_path_enabled");
+        mSpecCfg.set(cfg);
+    }
     void setDownstreamExecute(midcore::Execute* exe) { mDownstreamExecute = exe; }
     void setROB(midcore::ReorderBuffer* rob) { mRob = rob; }
     void setLSQ(midcore::LSQ* lsq) { mLsq = lsq; }
@@ -309,9 +311,13 @@ class Rename : public sparta::Unit {
 
     // Enable direct mode (bypass DecodeQueue)
     void setDirectMode(bool enabled) { mDirectMode = enabled; }
+    void setOooEnabled(bool enabled) { mOooEnabled = enabled; }
+
+    // In-order mode: a load's data reaches the bypass at data_cycle; its consumers may dispatch the cycle before.
+    void wakeOnLoadData(const std::vector<core::PhysRegRef>& dsts, uint64_t data_cycle);
 
     uint64_t numDispatched() const { return mNumDispatched.get(); }
-    uint64_t numPrfStallCycles() const { return mNumPrfStallCycles.get(); }
+    uint64_t numZeroDispatchCycles() const { return mNumZeroDispatchCycles.get(); }
     uint64_t numCheckpointStallCycles() const { return mNumCheckpointStallCycles.get(); }
 
     // Top-down slot accounting (see accountSlots_)
@@ -329,8 +335,15 @@ class Rename : public sparta::Unit {
     void receiveCommits_(const std::vector<core::PhysRegRef>& old_dsts);
     void receiveCompletions_(const std::vector<core::PhysRegRef>& completions);
     void receiveFlush_(const core::FlushRequest& req);
+
+    // Roll the RAT back to a flush's fetch_seq by undoing younger renames from the in-flight
+    // history. Recovers the map at any flush point (including a non-branch trap/
+    // interrupt resync, where no branch checkpoint exists). PRNs are freed by the
+    // ROB-squash path, so this only restores the map.
+    void rollbackRatTo_(uint64_t branch_fetch_seq, bool apply_to_rat);
+    void pruneCommittedHistory_();
     void receiveFreedRegs_(const std::vector<core::PhysRegRef>& regs);
-    void receiveCheckpointRelease_(const uint64_t& branch_tag);
+    void receiveCheckpointRelease_(const uint64_t& branch_fetch_seq);
     void receivePackets_(const std::vector<core::DecodePacket>& pkts);
 
     uint32_t tickOoo_();
@@ -385,9 +398,17 @@ class Rename : public sparta::Unit {
     PhysicalRegisterFile mPrf;
     ArchitecturalScoreboard mArchScoreboard;
     CheckpointManager mCheckpointMgr;
-    bool mOooEnabled;
+
+    // In-flight destination-rename history, oldest at front.
+    struct RenameHistoryRecord {
+        uint64_t fetch_seq{0};
+        core::RegType type{core::RegType::Int};
+        uint8_t arch_reg{0};
+        uint16_t old_phys{0};  // RAT mapping this rename overwrote
+    };
+    std::deque<RenameHistoryRecord> mRenameHistory;
+    bool mOooEnabled{true};
     uint32_t mDispatchWidth;
-    bool mLogEnabled{false};
     bool mDirectMode{false};
 
     // Speculation depth tracking (for visualization/debugging)
@@ -402,13 +423,14 @@ class Rename : public sparta::Unit {
     bool mRecoveryPending{false};
 
     core::PipelineVisualizer* mVis{nullptr};
+    core::SpeculationConfigRef mSpecCfg;
 
     std::vector<core::RenamedPacket> mRenamedBuf;
     std::vector<core::IssuePacket> mIssuedBuf;
     std::vector<core::DecodePacket> mPendingPackets;  // Buffer for direct mode
 
     sparta::Counter mNumDispatched;
-    sparta::Counter mNumPrfStallCycles;
+    sparta::Counter mNumZeroDispatchCycles;
     sparta::Counter mNumCheckpointStallCycles;
 
     // Top-down slot counters

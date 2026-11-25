@@ -5,7 +5,6 @@
 
 #include <iostream>
 
-#include "Common/SpeculationConfig.hpp"
 #include "Common/SpeculationUtils.hpp"
 #include "Frontend/DecodeQueue/DecodeQueue.hpp"
 #include "LoadStoreUnit/LSQ/LSQ.hpp"
@@ -20,11 +19,10 @@ Rename::Rename(sparta::TreeNode* node, const RenameParams* params)
     : sparta::Unit(node),
       mPrf(params->num_phys_regs, params->freelist_headroom),
       mCheckpointMgr(params->max_branch_checkpoints),
-      mOooEnabled(params->ooo_enabled),
       mDispatchWidth(params->dispatch_width),
-      mLogEnabled(params->log_enabled),
       mNumDispatched(&unit_stat_set_, "num_dispatched", "Total instructions dispatched", sparta::Counter::COUNT_NORMAL),
-      mNumPrfStallCycles(&unit_stat_set_, "num_prf_stall_cycles", "Cycles stalled on register hazards", sparta::Counter::COUNT_NORMAL),
+      mNumZeroDispatchCycles(&unit_stat_set_, "num_zero_dispatch_cycles", "Cycles a uop was waiting to dispatch and none was dispatched",
+                             sparta::Counter::COUNT_NORMAL),
       mNumCheckpointStallCycles(&unit_stat_set_, "num_checkpoint_stall_cycles", "Cycles stalled on checkpoint hazards", sparta::Counter::COUNT_NORMAL),
       mTopdownCycles(&unit_stat_set_, "topdown_cycles", "Cycles covered by top-down slot accounting", sparta::Counter::COUNT_NORMAL),
       mTopdownSlots(&unit_stat_set_, "topdown_slots", "Dispatch slots (cycles x dispatch_width)", sparta::Counter::COUNT_NORMAL),
@@ -43,7 +41,7 @@ Rename::Rename(sparta::TreeNode* node, const RenameParams* params)
       mStallPrfFull(&unit_stat_set_, "dispatch_stall_prf_full", "Cycles dispatch stopped early for lack of free physical registers",
                     sparta::Counter::COUNT_NORMAL),
       mStallSchedulerFull(&unit_stat_set_, "dispatch_stall_scheduler_full",
-                          "Cycles dispatch stopped early because the issue scheduler (OOO) or execute group (in-order) was full",
+                          "Cycles dispatch stopped early because the issue scheduler (OOO), or an execute group, issue port or divider (in-order), was full",
                           sparta::Counter::COUNT_NORMAL),
       mStallLoadQueueFull(&unit_stat_set_, "dispatch_stall_load_queue_full", "Cycles dispatch stopped early for lack of a load-queue entry",
                           sparta::Counter::COUNT_NORMAL),
@@ -65,7 +63,6 @@ Rename::Rename(sparta::TreeNode* node, const RenameParams* params)
     (void)static_cast<bool>(params->regfile_banking_enabled);
     (void)static_cast<uint32_t>(params->regfile_num_banks);
     (void)static_cast<uint32_t>(params->regfile_reads_per_bank);
-    (void)static_cast<uint32_t>(params->regfile_writes_per_bank);
 }
 
 void Rename::receiveCompletions_(const std::vector<core::PhysRegRef>& completions) {
@@ -94,27 +91,30 @@ void Rename::receiveFlush_(const core::FlushRequest& req) {
     }
     ILOG("[rename] cycle " << cycle << " Squashed " << squashed_count << " pending packets, remaining=" << mPendingPackets.size());
 
-    // Restore RAT state from checkpoint
-    if (mCheckpointMgr.hasCheckpoint(req.branch_tag)) {
-        bool restored = mCheckpointMgr.restore(req.branch_tag, mPrf);
-        if (restored) {
-            ILOG("[rename] Restored RAT from checkpoint for tag=" << req.branch_tag);
-        }
-    } else {
-        ILOG("[rename] No checkpoint found for branch_tag=" << req.branch_tag);
+    // Restore the RAT to the flush point: a branch checkpoint restores the whole map
+    // at once; otherwise (non-branch trap/interrupt resync, or no checkpoint) fall back
+    // to the history walk-back. Either way, drop squashed history younger than the flush.
+    bool restored_via_ckpt = false;
+    if (mCheckpointMgr.hasCheckpoint(req.branch_fetch_seq)) {
+        restored_via_ckpt = mCheckpointMgr.restore(req.branch_fetch_seq, mPrf);
+        if (restored_via_ckpt) ILOG("[rename] Restored RAT from checkpoint for fetch_seq=" << req.branch_fetch_seq);
     }
+    rollbackRatTo_(req.branch_fetch_seq, /*apply_to_rat=*/!restored_via_ckpt);
 
-    // The bubble before the flush is charged to the frontend; the bubble until the
-    // first post-flush uop is dispatched is recovery.
-    endBubble_(false);
+    // In-order path has no RAT; clear scoreboard busy bits left by squashed writers.
+    mArchScoreboard.restoreToTag(req.branch_tag);
+
+    // The bubble before the flush is charged to the frontend, unless wrong path is off: Fetch then
+    // held at the mispredicted branch. The bubble until the first post-flush uop is recovery.
+    endBubble_(!mSpecCfg->enabled);
     mRecoveryPending = true;
 
     // Release all checkpoints for younger branches
-    mCheckpointMgr.releaseYoungerThan(req.branch_tag);
+    mCheckpointMgr.releaseYoungerThan(req.branch_fetch_seq);
 
     // Also release the mispredicted branch's checkpoint itself
     // (it's no longer needed after restoration)
-    mCheckpointMgr.release(req.branch_tag);
+    mCheckpointMgr.release(req.branch_fetch_seq);
 
     // Update speculation depth tracking
     // After misprediction recovery, depth should be one less than the branch's depth
@@ -128,6 +128,37 @@ void Rename::receiveFlush_(const core::FlushRequest& req) {
     ILOG("[rename] Flush complete. Active checkpoints: " << mCheckpointMgr.numActive() << " new_depth=" << static_cast<int>(mCurrentWrongPathDepth));
 }
 
+void Rename::rollbackRatTo_(uint64_t branch_fetch_seq, bool apply_to_rat) {
+    // Undo younger-than-flush renames youngest first; the last write per reg wins,
+    // leaving the RAT at its state as of the branch. PRNs are freed by ROB-squash.
+    size_t undone = 0;
+    while (!mRenameHistory.empty() && mRenameHistory.back().fetch_seq > branch_fetch_seq) {
+        const auto& rec = mRenameHistory.back();
+        if (apply_to_rat) {
+            mPrf.mapping(rec.type, rec.arch_reg).speculativeRegister = rec.old_phys;
+        }
+        mRenameHistory.pop_back();
+        ++undone;
+    }
+    if (undone) {
+        ILOG("[rename] Rolled back " << undone << " rename records to fetch_seq " << branch_fetch_seq
+                                     << (apply_to_rat ? " (RAT restored via walk-back)" : " (history pruned; RAT via checkpoint)"));
+    }
+}
+
+void Rename::pruneCommittedHistory_() {
+    // Records older than the oldest in-flight ROB entry are committed; drop them.
+    if (!mRob) return;
+    if (mRob->empty()) {
+        mRenameHistory.clear();
+        return;
+    }
+    const uint64_t oldest_inflight = mRob->head().fetch_seq;
+    while (!mRenameHistory.empty() && mRenameHistory.front().fetch_seq < oldest_inflight) {
+        mRenameHistory.pop_front();
+    }
+}
+
 void Rename::receiveFreedRegs_(const std::vector<core::PhysRegRef>& regs) {
     for (const auto& ref : regs) {
         mPrf.releaseRegisterSafe(ref.phys_reg, ref.type);
@@ -135,9 +166,9 @@ void Rename::receiveFreedRegs_(const std::vector<core::PhysRegRef>& regs) {
     ILOG("[rename] Received " << regs.size() << " freed registers from ROB squash");
 }
 
-void Rename::receiveCheckpointRelease_(const uint64_t& branch_tag) {
-    mCheckpointMgr.release(branch_tag);
-    ILOG("[rename] Released checkpoint for branch_tag=" << branch_tag << ", remaining=" << mCheckpointMgr.numActive());
+void Rename::receiveCheckpointRelease_(const uint64_t& branch_fetch_seq) {
+    mCheckpointMgr.release(branch_fetch_seq);
+    ILOG("[rename] Released checkpoint for fetch_seq=" << branch_fetch_seq << ", remaining=" << mCheckpointMgr.numActive());
 }
 
 void Rename::receivePackets_(const std::vector<core::DecodePacket>& pkts) {
@@ -152,7 +183,7 @@ bool Rename::isReady() const {
     if (mDirectMode) {
         return !mPendingPackets.empty();
     }
-    if (!mDecodeQueue || mDecodeQueue->isEmpty()) return false;
+    if (!mDecodeQueue || !mDecodeQueue->hasReady()) return false;
     return true;
 }
 
@@ -163,7 +194,7 @@ void Rename::tick() {
             return;
         }
     } else {
-        if (!mDecodeQueue || mDecodeQueue->isEmpty()) {
+        if (!mDecodeQueue || !mDecodeQueue->hasReady()) {
             accountSlots_(0, DispatchStall::Frontend);
             return;
         }
@@ -177,7 +208,7 @@ void Rename::tick() {
     }
 
     if (dispatched == 0) {
-        ++mNumPrfStallCycles;
+        ++mNumZeroDispatchCycles;
     } else {
         mNumDispatched += dispatched;
     }
@@ -251,7 +282,7 @@ void Rename::accountSlots_(uint32_t dispatched, DispatchStall stall) {
     }
 }
 
-bool Rename::hasPendingPacket_() const { return mDirectMode ? !mPendingPackets.empty() : !mDecodeQueue->isEmpty(); }
+bool Rename::hasPendingPacket_() const { return mDirectMode ? !mPendingPackets.empty() : mDecodeQueue->hasReady(); }
 
 const core::DecodePacket* Rename::peekPacket_() const {
     if (mDirectMode) {
@@ -311,7 +342,7 @@ uint32_t Rename::tickOoo_() {
 
         // Stall dispatch when no LQ/SQ credit is available so memory-op occupancy stays bounded.
         const bool is_mem_load = (peek->uop_type == core::UopType::Load);
-        const bool is_mem_store = (peek->uop_type == core::UopType::Store);
+        const bool is_mem_store = (peek->uop_type == core::UopType::Store || peek->uop_type == core::UopType::Fence);
         if (mLsq && is_mem_load && !mLsq->canClaimLoad()) {
             mDispatchStall = DispatchStall::LoadQueueFull;
             break;
@@ -321,9 +352,9 @@ uint32_t Rename::tickOoo_() {
             break;
         }
 
-        // Check if branch needs checkpoint and if we have capacity
+        // As in BOOM (MicroOp.allocate_brtag), a direct jump takes no checkpoint: it cannot mispredict.
         bool is_branch = (peek->uop_type == core::UopType::Branch);
-        bool need_checkpoint = is_branch && core::getSpeculationConfig().enabled;
+        bool need_checkpoint = is_branch && !peek->direct_jump && mSpecCfg->enabled;
         if (need_checkpoint && !mCheckpointMgr.canAllocate()) {
             ++mNumCheckpointStallCycles;
             mDispatchStall = DispatchStall::CheckpointFull;
@@ -332,16 +363,10 @@ uint32_t Rename::tickOoo_() {
 
         // Pull the packet
         auto dp = pullPacket_();
-        endBubble_(mRecoveryPending || dp.after_mispredict_stall);
-
-        // Reserve slot to prevent over-dispatching in same cycle
-        mDownstream->reserveSlot(dp.uop_type);
+        endBubble_(mRecoveryPending);
 
         // Claim the LSQ credit now that the uop is committed to dispatch.
-        if (mLsq && is_mem_load)
-            mLsq->claimLoad(dp.pkt.fetch_seq, dp.pkt.tag, dp.pkt.wrong_path_depth);
-        else if (mLsq && is_mem_store)
-            mLsq->claimStore(dp.pkt.fetch_seq, dp.pkt.tag, dp.pkt.wrong_path_depth);
+        if (mLsq && (is_mem_load || is_mem_store)) mLsq->claim(dp);
 
         core::RenamedPacket rpkt;
         rpkt.pkt = dp.pkt;
@@ -350,6 +375,7 @@ uint32_t Rename::tickOoo_() {
         rpkt.latency = dp.latency;
         rpkt.predicted_taken = dp.predicted_taken;
         rpkt.was_mispredicted = dp.was_mispredicted;
+        rpkt.target_mispredicted = dp.target_mispredicted;
 
         std::vector<core::PhysRegRef> old_phys_dsts;
         std::vector<core::PhysRegRef> new_phys_dsts;
@@ -367,6 +393,7 @@ uint32_t Rename::tickOoo_() {
                 break;
             }
         }
+        rpkt.scheduler = mDownstream->reserveSlot(rpkt);
 
         for (const auto& dst : dst_regs) {
             if (dst.type == core::RegType::Int && dst.number == 0) continue;
@@ -380,15 +407,18 @@ uint32_t Rename::tickOoo_() {
             new_phys_dsts.push_back({new_phys, dst.type});
 
             m.speculativeRegister = new_phys;
+
+            // Record the overwritten mapping so a flush can roll the RAT back to any tag.
+            mRenameHistory.push_back({dp.pkt.fetch_seq, dst.type, dst.number, old_phys});
         }
 
         // Allocate checkpoint for branches
         if (need_checkpoint) {
-            auto slot = mCheckpointMgr.allocate(dp.pkt.tag);
+            auto slot = mCheckpointMgr.allocate(dp.pkt.fetch_seq);
             if (slot) {
                 mCheckpointMgr.saveRAT(*slot, mPrf);
                 rpkt.checkpoint_slot = slot;
-                ILOG("[rename] Allocated checkpoint slot=" << *slot << " for branch_tag=" << dp.pkt.tag);
+                ILOG("[rename] Allocated checkpoint slot=" << *slot << " for fetch_seq=" << dp.pkt.fetch_seq);
             }
         }
 
@@ -401,7 +431,8 @@ uint32_t Rename::tickOoo_() {
             entry.wrong_path_depth = dp.pkt.wrong_path_depth;  // Use packet's depth from fetch
             entry.old_phys_dsts = std::move(old_phys_dsts);
             entry.new_phys_dsts = std::move(new_phys_dsts);
-            entry.checkpoint_slot = rpkt.checkpoint_slot;
+            entry.dispatch_cycle = getClock()->currentCycle();
+            entry.was_mispredicted = dp.was_mispredicted;
             rpkt.rob_token = mRob->allocate(std::move(entry));
         }
 
@@ -434,7 +465,7 @@ uint32_t Rename::tickInorder_() {
             mDispatchStall = DispatchStall::SchedulerFull;
             break;
         }
-        if (!mArchScoreboard.sourcesReady(src_regs)) {
+        if (!mArchScoreboard.sourcesReady(src_regs, getClock()->currentCycle())) {
             mDispatchStall = DispatchStall::OperandsNotReady;
             break;
         }
@@ -445,7 +476,7 @@ uint32_t Rename::tickInorder_() {
 
         // Stall dispatch when no LQ/SQ credit is available so memory-op occupancy stays bounded.
         const bool is_mem_load = (peek->uop_type == core::UopType::Load);
-        const bool is_mem_store = (peek->uop_type == core::UopType::Store);
+        const bool is_mem_store = (peek->uop_type == core::UopType::Store || peek->uop_type == core::UopType::Fence);
         if (mLsq && is_mem_load && !mLsq->canClaimLoad()) {
             mDispatchStall = DispatchStall::LoadQueueFull;
             break;
@@ -454,17 +485,19 @@ uint32_t Rename::tickInorder_() {
             mDispatchStall = DispatchStall::StoreQueueFull;
             break;
         }
+        // Last check: it claims the issue port and divider.
+        if (!mDownstream->issueInorder(*peek)) {
+            mDispatchStall = DispatchStall::SchedulerFull;
+            break;
+        }
 
         // Pull the packet
         auto dp = pullPacket_();
-        endBubble_(mRecoveryPending || dp.after_mispredict_stall);
+        endBubble_(mRecoveryPending);
 
         mDownstreamExecute->reserveSlot(dp.uop_type);
 
-        if (mLsq && is_mem_load)
-            mLsq->claimLoad(dp.pkt.fetch_seq, dp.pkt.tag, dp.pkt.wrong_path_depth);
-        else if (mLsq && is_mem_store)
-            mLsq->claimStore(dp.pkt.fetch_seq, dp.pkt.tag, dp.pkt.wrong_path_depth);
+        if (mLsq && (is_mem_load || is_mem_store)) mLsq->claim(dp);
 
         core::IssuePacket ipkt;
         ipkt.pkt = dp.pkt;
@@ -473,16 +506,21 @@ uint32_t Rename::tickInorder_() {
         ipkt.latency = dp.latency;
         ipkt.predicted_taken = dp.predicted_taken;
         ipkt.was_mispredicted = dp.was_mispredicted;
+        ipkt.target_mispredicted = dp.target_mispredicted;
 
         for (const auto& src : src_regs) {
             if (core::isRegFileType(src.type)) ipkt.phys_srcs.push_back({src.number, src.type});
         }
 
+        // As in Issue: fixed-latency results reach a consumer dispatched `latency` cycles later on the
+        // bypass; loads and atomics wake when their data is known.
+        const bool waits_for_data = ipkt.uop_type == core::UopType::Load || ipkt.pkt.inst_class == cpu::InstClass::Atomic;
+        const uint64_t ready_cycle = waits_for_data ? ArchitecturalScoreboard::kNever : getClock()->currentCycle() + ipkt.latency;
         for (const auto& dst : dst_regs) {
             if (!core::isRegFileType(dst.type)) continue;
             if (dst.type == core::RegType::Int && dst.number == 0) continue;
             ipkt.phys_dsts.push_back({dst.number, dst.type, ipkt.pkt.tag});
-            mArchScoreboard.markBusy(dst.number, dst.type, ipkt.pkt.tag);
+            mArchScoreboard.markBusy(dst.number, dst.type, ipkt.pkt.tag, ready_cycle);
         }
 
         if (mRob) {
@@ -492,6 +530,8 @@ uint32_t Rename::tickInorder_() {
             entry.pc = dp.pkt.pc;
             entry.uop_type = dp.uop_type;
             entry.wrong_path_depth = dp.pkt.wrong_path_depth;  // Use packet's depth from fetch
+            entry.dispatch_cycle = getClock()->currentCycle();
+            entry.was_mispredicted = dp.was_mispredicted;
             ipkt.rob_token = mRob->allocate(std::move(entry));
         }
 
@@ -507,10 +547,16 @@ uint32_t Rename::tickInorder_() {
     return dispatched;
 }
 
+void Rename::wakeOnLoadData(const std::vector<core::PhysRegRef>& dsts, uint64_t data_cycle) {
+    const uint64_t dispatch_cycle = data_cycle > 0 ? data_cycle - 1 : 0;
+    for (const auto& ref : dsts) mArchScoreboard.readyAt(static_cast<uint8_t>(ref.phys_reg), ref.type, ref.tag, dispatch_cycle);
+}
+
 void Rename::receiveCommits_(const std::vector<core::PhysRegRef>& old_dsts) {
     for (const auto& ref : old_dsts) {
         mPrf.releaseRegister(ref.phys_reg, ref.type);
     }
+    pruneCommittedHistory_();
 }
 
 }  // namespace midcore

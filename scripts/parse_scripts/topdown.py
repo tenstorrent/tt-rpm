@@ -44,7 +44,7 @@ REPORT_GLOBS = ("*.json", "*.json.bz2")
 
 # Supporting counters shown as misses per kilo-instruction (unit, counter).
 MPKI_COUNTERS = [
-    ("Branch mispredicts", "branch_predictor", "num_mispredicted"),
+    ("Branch mispredicts", "writeback", "num_retired_mispredicts"),
     ("I-cache misses", "icache", "num_misses"),
     ("D-cache misses", "dcache", "num_misses"),
     ("L2 misses", "l2cache", "num_misses"),

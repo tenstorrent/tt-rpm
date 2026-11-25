@@ -8,9 +8,18 @@
 # but under a reusable name.
 #
 # Fields:
-#   type:  'elf'  -> passed to the model as --target-elf  (execution-driven)
+#   type:  'elf'      -> passed to the model as --target-elf (execution-driven)
+#          'snapshot' -> passed as --snapshot (execution-driven): a Whisper snapshot
+#                        directory, from whose restored state Whisper runs forward.
+#                        On the cluster the Whisper topology is inferred
+#                        from the snapshot's hart count: a multi-hart snapshot
+#                        (registers0..N-1) runs ONE shared Whisper (shared address
+#                        space, realistic multi-core); a single-hart snapshot runs
+#                        an independent Whisper per core.
+#          Snapshots never EOF, so they always honor the config's
+#          num_instructions/num_cycles cap.
 #   path:  absolute or RPM-root-relative directory containing workload files
-#   glob:  filename pattern to discover workload files inside `path`
+#   glob:  filename pattern to discover workload files/dirs inside `path`
 #
 # Point `path` at your own workload directories and add as many entries as you
 # need.

@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
+Dynamic-Insts:
+  mcf_r-ref-inp0: 1616000000000
+  x264_r-ref-inp0: 1751000000000
+  xz_r-ref-inp0: 300000000000
+  xz_r-ref-inp1: 100000000000

@@ -14,6 +14,7 @@
 
 #include "Common/PipelinePacket.hpp"
 #include "Common/PipelineVisualizer.hpp"
+#include "Common/SpeculationConfig.hpp"
 #include "Common/SpeculationUtils.hpp"
 
 namespace cpu {
@@ -117,22 +118,6 @@ class ReorderBuffer {
 
         return freed_regs;
     }
-
-    // Get entry by tag (for checkpoint lookup, etc.)
-    core::ROBEntry* findByTag(uint64_t tag) {
-        if (mSize == 0) return nullptr;
-
-        uint32_t count = mSize;
-        uint32_t idx = mHead;
-        while (count > 0) {
-            if (mEntries[idx].tag == tag) {
-                return &mEntries[idx];
-            }
-            idx = (idx + 1) % mCapacity;
-            --count;
-        }
-        return nullptr;
-    }
 };
 
 class WritebackParams : public sparta::ParameterSet {
@@ -143,7 +128,9 @@ class WritebackParams : public sparta::ParameterSet {
     PARAMETER(uint32_t, retire_width, 4, "Max instructions retired per cycle")
     PARAMETER(uint32_t, rob_capacity, 128, "Reorder buffer capacity")
     PARAMETER(uint32_t, retire_timeout_cycles, 10000, "Watchdog: max cycles with no retirement before asserting")
-    PARAMETER(bool, log_enabled, false, "Enable debug logging for this unit")
+    // Age is cycles since dispatch; a stalled oldest load past the threshold counts as missing that cache level.
+    PARAMETER(uint32_t, retire_stall_l1_miss_age, 4, "Oldest-load age (cycles) beyond which a retire stall counts as an L1 miss")
+    PARAMETER(uint32_t, retire_stall_l2_miss_age, 16, "Oldest-load age (cycles) beyond which a retire stall counts as an L2 miss")
 };
 
 class Writeback : public sparta::Unit {
@@ -167,6 +154,9 @@ class Writeback : public sparta::Unit {
     // the trap handler when Whisper takes an unmodeled trap/interrupt at retire.
     sparta::DataOutPort<core::FlushRequest> trap_flush_out{&unit_port_set_, "trap_flush_out"};
 
+    // Commit-time branch-predictor training: fetch_seq of a retiring branch.
+    sparta::DataOutPort<uint64_t> branch_retire_out{&unit_port_set_, "branch_retire_out"};
+
     // Correct branch resolution - decrements depth of younger instructions
     sparta::DataInPort<core::BranchResolved> branch_resolved_in{&unit_port_set_, "branch_resolved_in"};
 
@@ -175,12 +165,15 @@ class Writeback : public sparta::Unit {
     void setExecutionDriver(cpu::ExecutionDriver* d) { mDriver = d; }
     void setVisualizer(core::PipelineVisualizer* v) { mVis = v; }
     void setLsq(LSQ* lsq) { mLsq = lsq; }
+    void setSpeculationConfig(const core::SpeculationConfig* cfg) { mSpecCfg.set(cfg); }
     void setInstructionLimit(uint64_t limit) { mInstructionLimit = limit; }
 
     ReorderBuffer& rob() { return mRob; }
 
     uint64_t numRetired() const { return mNumRetired.get(); }
     uint64_t numSquashed() const { return mNumSquashed.get(); }
+    uint64_t numRetiredBranches() const { return mNumRetiredBranches.get(); }
+    uint64_t numRetiredMispredicts() const { return mNumRetiredMispredicts.get(); }
 
    private:
     void receiveCompletions_(const std::vector<core::ROBToken>& tokens);
@@ -189,10 +182,12 @@ class Writeback : public sparta::Unit {
 
     cpu::ExecutionDriver* mDriver{nullptr};
     core::PipelineVisualizer* mVis{nullptr};
+    core::SpeculationConfigRef mSpecCfg;
     LSQ* mLsq{nullptr};
     uint32_t mRetireWidth;
     ReorderBuffer mRob;
-    bool mLogEnabled{false};
+    uint32_t mRetireStallL1MissAge;
+    uint32_t mRetireStallL2MissAge;
 
     std::vector<core::PhysRegRef> mOldDstsBuf;
     uint64_t mInstructionLimit{0};
@@ -207,6 +202,14 @@ class Writeback : public sparta::Unit {
 
     sparta::Counter mNumRetired;
     sparta::Counter mNumSquashed;
+    sparta::Counter mNumRetiredBranches;
+    sparta::Counter mNumRetiredMispredicts;
+
+    // Cycles nothing retired behind an unfinished oldest load; each is a subset of the previous.
+    sparta::Counter mRetireStallLoadAny;
+    sparta::Counter mRetireStallLoadL1Miss;
+    sparta::Counter mRetireStallLoadL2Miss;
+    sparta::Counter mNumMemOrderFlushes;
 
     // TRACE-only: detect non-contiguous retire order (debugging wrong-path retire bug)
     uint64_t mLastRetiredTag{0};
@@ -218,6 +221,8 @@ class Writeback : public sparta::Unit {
     // Tag of the diverged ROB head we already sent a trap flush for, to avoid
     // re-sending every cycle while the squash propagates.
     uint64_t mTrapFlushSentTag{static_cast<uint64_t>(-1)};
+    // fetch_seq of the load a memory-order replay was sent for (tags repeat after the replay).
+    uint64_t mOrderFlushSentSeq{static_cast<uint64_t>(-1)};
 };
 
 }  // namespace midcore
