@@ -5,28 +5,28 @@
 
 #include <cstdint>
 
+#include "sparta/utils/SpartaAssert.hpp"
+
 namespace core {
 
-// Centralized configuration for speculation behavior.
-// Set during simulation initialization from config.yaml.
+// Speculation behavior of one core. CoreImpl owns one per core, so cores in a cluster can differ.
 struct SpeculationConfig {
-    bool enabled{false};           // Master switch for wrong-path speculation
-    uint8_t max_depth{8};          // Max nested speculation levels
-    uint32_t max_checkpoints{32};  // Max in-flight branch checkpoints
-
-    // Derived helpers
-    bool allowSpeculativeFetch() const { return enabled; }
+    bool enabled{false};   // Master switch for wrong-path speculation
+    uint8_t max_depth{8};  // Max nested speculation levels
 };
 
-// Global speculation configuration - set once at startup, read by all stages.
-// Thread-safe for read access after initialization.
-inline SpeculationConfig& getMutableSpeculationConfig() {
-    static SpeculationConfig sConfig;
-    return sConfig;
-}
+// A unit's pointer to its core's SpeculationConfig. Reading it before CoreImpl sets it asserts,
+// so a unit left unwired cannot quietly run with speculation off.
+class SpeculationConfigRef {
+   public:
+    void set(const SpeculationConfig* cfg) { mCfg = cfg; }
+    const SpeculationConfig* operator->() const {
+        sparta_assert(mCfg != nullptr, "SpeculationConfig read before CoreImpl::wireInternal set it");
+        return mCfg;
+    }
 
-inline const SpeculationConfig& getSpeculationConfig() { return getMutableSpeculationConfig(); }
-
-inline void setSpeculationConfig(const SpeculationConfig& cfg) { getMutableSpeculationConfig() = cfg; }
+   private:
+    const SpeculationConfig* mCfg{nullptr};
+};
 
 }  // namespace core

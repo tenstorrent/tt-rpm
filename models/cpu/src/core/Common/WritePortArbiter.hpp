@@ -45,6 +45,7 @@ class WritePortArbiter {
     const std::vector<WriteCandidate>& granted() const { return mGranted; }
 
     bool isGranted(uint64_t tag) const { return mGrantedTags.count(tag); }
+    uint32_t numDenied() const { return mNumDenied; }  // candidates the last arbitrate() held back
 
     void setVisualizer(core::PipelineVisualizer* v) { mVis = v; }
 
@@ -56,6 +57,7 @@ class WritePortArbiter {
 
     std::vector<WriteCandidate> mGranted;
     std::unordered_set<uint64_t> mGrantedTags;
+    uint32_t mNumDenied{0};
 
     core::PipelineVisualizer* mVis{nullptr};
 };

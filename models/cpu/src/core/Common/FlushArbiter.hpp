@@ -3,6 +3,10 @@
 
 #pragma once
 
+#include <deque>
+#include <utility>
+#include <vector>
+
 #include "sparta/ports/DataPort.hpp"
 #include "sparta/simulation/ParameterSet.hpp"
 #include "sparta/simulation/Unit.hpp"
@@ -10,14 +14,16 @@
 
 #include "Common/PipelinePacket.hpp"
 
+namespace frontend {
+class FetchStructures;
+}
+
 namespace core {
 
 class FlushArbiterParams : public sparta::ParameterSet {
    public:
     FlushArbiterParams(sparta::TreeNode* n)
         : sparta::ParameterSet(n) {}
-
-    PARAMETER(bool, log_enabled, false, "Enable debug logging for this unit")
 };
 
 class FlushArbiter : public sparta::Unit {
@@ -31,6 +37,8 @@ class FlushArbiter : public sparta::Unit {
     sparta::DataInPort<FlushRequest> exe_flush_in{&unit_port_set_, "exe_flush_in"};
     // Trap/interrupt redirect from Writeback (full recovery, like an Execute flush)
     sparta::DataInPort<FlushRequest> retire_flush_in{&unit_port_set_, "retire_flush_in"};
+    // fetch_seq of each retiring branch
+    sparta::DataInPort<uint64_t> branch_retire_in{&unit_port_set_, "branch_retire_in"};
 
     // Output ports to frontend units (BP flush path - lightweight redirect)
     sparta::DataOutPort<FlushRequest> flush_to_fq_out{&unit_port_set_, "flush_to_fq_out"};
@@ -49,24 +57,29 @@ class FlushArbiter : public sparta::Unit {
 
     // Called by PipelineClock each cycle to process pending flushes
     void tick();
+    void setFetch(const frontend::FetchStructures* fetch) { mFetch = fetch; }
 
     uint64_t numBpFlushes() const { return mNumBpFlushes.get(); }
     uint64_t numExeFlushes() const { return mNumExeFlushes.get(); }
     uint64_t numDroppedBpFlushes() const { return mNumDroppedBpFlushes.get(); }
+    uint64_t numDroppedExeFlushes() const { return mNumDroppedExeFlushes.get(); }
 
    private:
     void receiveBpFlush_(const FlushRequest& req);
     void receiveExeFlush_(const FlushRequest& req);
-    void processFlush_(const FlushRequest& req);
+    void receiveBranchRetire_(const uint64_t& fetch_seq);
 
-    // Only allow one flush per cycle.
-    uint64_t mLastFlushCycle{0};
-
-    bool mLogEnabled{false};
+    // A flush squashes the fetch_seqs in (branch, fetch frontier); a flush from a squashed branch is dropped.
+    // Predictor flushes squash only the front end, and every Execute flush supersedes them.
+    const frontend::FetchStructures* mFetch{nullptr};
+    std::deque<std::pair<uint64_t, uint64_t>> mExeSquashed;  // ascending; pruned as branches retire
+    std::vector<std::pair<uint64_t, uint64_t>> mBpSquashed;  // since the last Execute flush
+    uint64_t mExeFrontier{0};                                // fetch frontier at the last Execute flush
 
     sparta::Counter mNumBpFlushes;
     sparta::Counter mNumExeFlushes;
     sparta::Counter mNumDroppedBpFlushes;
+    sparta::Counter mNumDroppedExeFlushes;
 };
 
 }  // namespace core

@@ -38,6 +38,7 @@ class WritebackBuffer {
         std::vector<core::PhysRegRef> phys_dsts;
         core::ROBToken rob_token;
         uint8_t source_id{0};  // Execute group or LSQ
+        uint8_t wrong_path_depth{0};
         uint8_t cycles_remaining{0};
         bool ready{false};  // Countdown complete
     };
@@ -46,7 +47,8 @@ class WritebackBuffer {
 
     // Accept a completion from Execute or LSQ
     // Returns true if accepted, false if buffer full
-    bool accept(uint64_t tag, uint64_t fetch_seq, const std::vector<core::PhysRegRef>& phys_dsts, const core::ROBToken& rob_token, uint8_t source_id);
+    bool accept(uint64_t tag, uint64_t fetch_seq, uint8_t wrong_path_depth, const std::vector<core::PhysRegRef>& phys_dsts, const core::ROBToken& rob_token,
+                uint8_t source_id);
 
     // Advance countdowns, mark entries as ready
     void tick();
@@ -56,6 +58,9 @@ class WritebackBuffer {
 
     // Remove an entry after it's been granted a write port
     void remove(uint64_t tag);
+
+    // Drop entries younger than a mispredicted branch; returns how many.
+    uint32_t squash(const core::FlushRequest& req);
 
     // Query
     bool isFull() const { return mEntries.size() >= mCapacity; }

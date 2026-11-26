@@ -1,0 +1,93 @@
+{
+ "Statistics": {
+  "@ on _SPARTA_global_node_": {
+   "scheduler": {
+    "host_machine_wall_runtime_seconds": {
+     "val": 5,
+     "desc": "",
+     "vis": 0
+    }
+   },
+   "clocks": {
+    "Root": {
+     "cycles": {
+      "val": 500000,
+      "desc": "",
+      "vis": 0
+     },
+     "cpu_clock_0": {
+      "cycles": {
+       "val": 1000,
+       "desc": "",
+       "vis": 0
+      }
+     }
+    }
+   },
+   "top": {
+    "core0": {
+     "writeback": {
+      "ordered_keys": [
+       "num_retired"
+      ],
+      "num_retired": {
+       "val": 1000,
+       "desc": "",
+       "vis": 0
+      },
+      "retire_stall_load_any": {
+       "val": 100,
+       "desc": "",
+       "vis": 0
+      },
+      "retire_stall_load_l1_miss": {
+       "val": 60,
+       "desc": "",
+       "vis": 0
+      },
+      "retire_stall_load_l2_miss": {
+       "val": 20,
+       "desc": "",
+       "vis": 0
+      }
+     },
+     "rename": {
+      "num_dispatched": {
+       "val": 1000,
+       "desc": "",
+       "vis": 0
+      },
+      "topdown_slots": {
+       "val": 4000,
+       "desc": "",
+       "vis": 0
+      },
+      "topdown_frontend_bound_slots": {
+       "val": 1000,
+       "desc": "",
+       "vis": 0
+      },
+      "topdown_recovery_slots": {
+       "val": 0,
+       "desc": "",
+       "vis": 0
+      },
+      "topdown_backend_bound_slots": {
+       "val": 2000,
+       "desc": "",
+       "vis": 0
+      },
+      "topdown_backend_memory_slots": {
+       "val": 1000,
+       "desc": "",
+       "vis": 0
+      }
+     }
+    }
+   }
+  }
+ },
+ "vis": {},
+ "siminfo": {},
+ "report_metadata": {}
+}

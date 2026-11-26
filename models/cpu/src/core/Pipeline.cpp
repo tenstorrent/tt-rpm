@@ -18,11 +18,13 @@
 #include "Frontend/FrontendMemoryStructures/FrontendMemoryStructures.hpp"
 #include "LoadStoreUnit/BackendMemoryStructures/BackendMemoryStructures.hpp"
 #include "LoadStoreUnit/LSQ/LSQ.hpp"
+#include "MemoryHierarchy/Dram/Dram.hpp"
 #include "MemoryHierarchy/L2Cache.hpp"
 #include "Midcore/Execute/Execute.hpp"
 #include "Midcore/Issue/Issue.hpp"
 #include "Midcore/Rename/Rename.hpp"
 #include "Midcore/Writeback/Writeback.hpp"
+#include "Mmu/Mmu.hpp"
 
 namespace core {
 
@@ -59,6 +61,7 @@ void PipelineClock::tick() {
 
     mWriteback->tick();
     mLsq->tick();
+    if (mMmu) mMmu->tick();
     mDcache->tick();
     // L2 ticks after both L1 caches so that fill responses queued this cycle
     // are dispatched to L1s via ports (delay=1) and arrive next cycle.
@@ -109,10 +112,15 @@ void PipelineClock::tick() {
 void PipelineClock::simulationTerminating_() { reportStats(); }
 
 void PipelineClock::reportStats() {
+    // Attributable per-core clock line: lets a test confirm the clock domains advance in
+    // proportion to their frequency (cycles(coreA)/cycles(coreB) == freq(A)/freq(B)).
+    std::cerr << "[clock] " << getClock()->getName() << " freq_mhz=" << getClock()->getFrequencyMhz() << " cycles=" << mCycle << "\n";
+
     uint64_t retired = mWriteback->numRetired();
     double ipc = (mCycle > 0) ? static_cast<double>(retired) / mCycle : 0.0;
     uint64_t delta_ret = retired - mLastRetired;
-    double hb_ipc = static_cast<double>(delta_ret) / kReportInterval;
+    uint64_t delta_cycles = mCycle - mLastReportCycle;
+    double hb_ipc = (delta_cycles > 0) ? static_cast<double>(delta_ret) / delta_cycles : 0.0;
     mLastRetired = retired;
 
     // Wall-clock throughput: KIPS = retired instr/s, KHz = simulated cycles/s, both
@@ -121,7 +129,6 @@ void PipelineClock::reportStats() {
     auto now = std::chrono::steady_clock::now();
     double elapsed_s = std::chrono::duration<double>(now - mStartTime).count();
     double window_s = std::chrono::duration<double>(now - mLastReportTime).count();
-    uint64_t delta_cycles = mCycle - mLastReportCycle;
     double kips = (elapsed_s > 0.0) ? retired / elapsed_s / 1000.0 : 0.0;
     double khz = (elapsed_s > 0.0) ? mCycle / elapsed_s / 1000.0 : 0.0;
     double hb_kips = (window_s > 0.0) ? delta_ret / window_s / 1000.0 : 0.0;
@@ -139,32 +146,53 @@ void PipelineClock::reportStats() {
     uint64_t dcTotal = dcHits + dcMisses;
     double dcRate = (dcTotal > 0) ? 100.0 * dcHits / dcTotal : 0.0;
 
-    uint64_t bpCorrect = mBp->numCorrect();
-    uint64_t bpMispred = mBp->numMispredicted();
-    uint64_t bpTotal = bpCorrect + bpMispred;
-    double bpAcc = (bpTotal > 0) ? 100.0 * bpCorrect / bpTotal : 0.0;
+    uint64_t bpTotal = mWriteback->numRetiredBranches();
+    uint64_t bpMispred = mWriteback->numRetiredMispredicts();
+    double bpAcc = (bpTotal > 0) ? 100.0 * (bpTotal - bpMispred) / bpTotal : 0.0;
 
     uint64_t l2Hits = mL2 ? mL2->numHits() : 0;
     uint64_t l2Misses = mL2 ? mL2->numMisses() : 0;
     uint64_t l2Total = l2Hits + l2Misses;
     double l2Rate = (l2Total > 0) ? 100.0 * l2Hits / l2Total : 0.0;
 
-    std::cerr << std::fixed << std::setprecision(3) << "\n=== Pipeline Stats @ cycle " << mCycle << " ===\n"
+    std::cerr << std::fixed << std::setprecision(3) << "\n=== Pipeline Stats @ cycle " << mCycle << " (" << getContainer()->getParent()->getName() << ") ===\n"
               << "  IPC:       " << ipc << "  heartbeat=" << hb_ipc << "  (retired=" << retired << ", cycles=" << mCycle << ")\n"
               << "  Speed:     " << kips << " KIPS  " << khz << " KHz  (heartbeat: " << hb_kips << " KIPS  " << hb_khz << " KHz, wall=" << elapsed_s << "s)\n"
               << "  Fetch:     fetched=" << mFetch->numFetched() << "  buffer_full_stall_cycles=" << mFetch->numBufferFullStallCycles() << "\n"
               << "  I-Cache:   hits=" << icHits << "  misses=" << icMisses << "  (hit_rate=" << icRate << "%)\n"
               << "  FetchQ:    enqueued=" << mFetchQueue->numEnqueued() << "  branch_wait_cycles=" << mFetchQueue->numBranchWaitCycles() << "\n"
-              << "  Decode:    decoded=" << mDecode->numDecoded() << "  mispred_stall_cycles=" << mDecode->numMispredStallCycles() << "\n"
+              << "  Decode:    decoded=" << mDecode->numDecoded() << "\n"
               << "  DecodeQ:   enqueued=" << mDecodeQueue->numEnqueued() << "\n"
-              << "  BP:        correct=" << bpCorrect << "  mispredicted=" << bpMispred << "  (accuracy=" << bpAcc << "%)\n"
-              << "  Rename:    dispatched=" << mRename->numDispatched() << "  prf_stall_cycles=" << mRename->numPrfStallCycles() << "\n"
+              << "  BP:        retired_branches=" << bpTotal << "  mispredicted=" << bpMispred << "  (accuracy=" << bpAcc << "%)\n"
+              << "  Rename:    dispatched=" << mRename->numDispatched() << "  zero_dispatch_cycles=" << mRename->numZeroDispatchCycles() << "\n"
               << "  Issue:     issued=" << mIssue->numIssued() << "  stall_cycles=" << mIssue->numStallCycles() << "\n"
               << "  Execute:   executed=" << mExecute->numExecuted() << "\n"
               << "  LSQ:       loads=" << mLsq->numLoads() << "  stores=" << mLsq->numStores() << "\n"
               << "  D-Cache:   hits=" << dcHits << "  misses=" << dcMisses << "  (hit_rate=" << dcRate << "%)\n";
+    if (mDcache->numShadowChecks() > 0) {
+        std::cerr << "  D-Shadow:  checks=" << mDcache->numShadowChecks() << "  stale_reads=" << mDcache->numShadowMismatches()
+                  << "  (data-carrying self-check vs Whisper)\n";
+    }
+    if (const auto* pf = mDcache->prefetchHost()) pf->report(std::cerr, "D-Pref:    ");
+    if (const auto* pf = mMemory->prefetchHost()) pf->report(std::cerr, "I-Pref:    ");
     if (mL2) {
-        std::cerr << "  L2-Cache:  hits=" << l2Hits << "  misses=" << l2Misses << "  (hit_rate=" << l2Rate << "%)\n";
+        std::cerr << "  L2-Cache:  hits=" << l2Hits << "  misses=" << l2Misses << "  (hit_rate=" << l2Rate
+                  << "%, mpki=" << (retired ? 1000.0 * l2Misses / retired : 0.0) << ")\n";
+        mL2->prefetchHost()->report(std::cerr, "L2-Pref:   ");
+    }
+    if (mDram) {
+        const auto& d = mDram->stats();
+        const uint64_t rb = d.row_hits + d.row_misses + d.row_conflicts;
+        std::cerr << "  DRAM:      reads=" << d.reads << "  writes=" << d.writes << "  row_hit/miss/conflict=" << d.row_hits << "/" << d.row_misses << "/"
+                  << d.row_conflicts << " (" << (rb ? 100.0 * d.row_hits / rb : 0.0) << "% hits)  avg_read_lat=" << mDram->avgReadLatency()
+                  << "  bw=" << mDram->bandwidthGBps() << " GB/s\n";
+    }
+    if (mMmu && mMmu->numItlbMisses() + mMmu->numDtlbMisses() > 0) {
+        const double kilo = std::max<uint64_t>(retired, 1) / 1000.0;
+        std::cerr << "  TLB:       itlb_mpki=" << mMmu->numItlbMisses() / kilo << "  dtlb_mpki=" << mMmu->numDtlbMisses() / kilo
+                  << "  l2tlb_mpki=" << mMmu->numL2TlbMisses() / kilo << "  walks=" << mMmu->numWalks() << " (superpage " << mMmu->numSuperpageWalks()
+                  << ")  avg_walk_cycles=" << static_cast<double>(mMmu->numWalkCycles()) / std::max<uint64_t>(mMmu->numWalks(), 1)
+                  << "  pwc_hits=" << mMmu->numPwcHits() << "\n";
     }
     std::cerr << "  Writeback: retired=" << retired << "\n";
 
@@ -202,7 +230,7 @@ void PipelineClock::deadlockDiag() {
     std::cerr << "  LSQ: loads=" << mLsq->numLoads() << " stores=" << mLsq->numStores() << " completion_order=" << mLsq->numCompletionOrder() << "\n";
 
     // Rename state
-    std::cerr << "  Rename: dispatched=" << mRename->numDispatched() << " prf_stalls=" << mRename->numPrfStallCycles() << "\n";
+    std::cerr << "  Rename: dispatched=" << mRename->numDispatched() << " zero_dispatch_cycles=" << mRename->numZeroDispatchCycles() << "\n";
 
     std::cerr << "=== END DEADLOCK DIAG ===\n\n";
 }

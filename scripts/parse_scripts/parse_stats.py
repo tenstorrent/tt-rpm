@@ -6,12 +6,12 @@
 """Parse RPM simulation log output and extract key performance statistics.
 
 Usage:
-    python parse_stats.py <sim.log>
-    python parse_stats.py <sim.log> --csv output.csv
-    python parse_stats.py <output_dir>          # looks for sim.log inside
+    python3 parse_stats.py <sim.log>
+    python3 parse_stats.py <sim.log> --csv output.csv
+    python3 parse_stats.py <output_dir>          # run_sim.sh output dir; reads its ilog.txt
 
 The helpers parse_retire_lines / parse_setup_time / extract_stats can also be
-imported and called with an arbitrary line iterator (see parse_slurm_results.py).
+imported and called with an arbitrary line iterator.
 """
 
 import argparse
@@ -25,6 +25,8 @@ from typing import Iterable
 RETIRE_PATTERN = re.compile(
     r"\[writeback\]\s+cycle\s+(\d+)\s+retired\s+tag=(\d+)\s+pc=(0x[0-9a-fA-F]+)"
 )
+# Each core's stats block opens with this header; older logs have no "(coreN)".
+HEADER_PATTERN = re.compile(r"=== Pipeline Stats @ cycle \d+(?: \(core(\d+)\))? ===")
 # End-of-run summary line emitted unconditionally by PipelineClock::reportStats.
 SUMMARY_PATTERN = re.compile(
     r"IPC:\s+([\d.]+)\s+heartbeat=[\d.]+\s+\(retired=(\d+),\s+cycles=(\d+)\)"
@@ -32,20 +34,24 @@ SUMMARY_PATTERN = re.compile(
 SETUP_TIME_PATTERN = re.compile(r"\[doSetupHelper\]\s+Spent:\s+([\d.]+)\s+seconds")
 
 
+class NoStatsError(ValueError):
+    """The log has neither retire lines nor a stats block: crashed, truncated, or not a sim log."""
+
+
 def extract_stats(lines: Iterable[str]) -> dict:
     """Scan a single pass over `lines` and collect retire + setup stats.
 
     Prefers per-retire log lines when present (gives first/last cycle bounds);
-    falls back to the end-of-run summary block which is always emitted.
+    falls back to the end-of-run summary block; raises NoStatsError if neither is there.
     """
     first_cycle = None
     last_cycle = 0
     last_tag = 0
     retire_samples = 0
     setup_time = 0.0
-    summary_retired = None
-    summary_cycles = None
-    summary_ipc = None
+    # A cluster log has a block per core; report core 0 (lowest index), as the study report does.
+    summaries = {}
+    core = -1
 
     for line in lines:
         m = RETIRE_PATTERN.search(line)
@@ -60,17 +66,22 @@ def extract_stats(lines: Iterable[str]) -> dict:
                 last_tag = tag
             retire_samples += 1
             continue
+        m = HEADER_PATTERN.search(line)
+        if m:
+            core = int(m.group(1)) if m.group(1) else -1
+            continue
         m = SUMMARY_PATTERN.search(line)
         if m:
-            summary_ipc = float(m.group(1))
-            summary_retired = int(m.group(2))
-            summary_cycles = int(m.group(3))
+            summaries[core] = (float(m.group(1)), int(m.group(2)), int(m.group(3)))
             continue
         if setup_time == 0.0:
             m = SETUP_TIME_PATTERN.search(line)
             if m:
                 setup_time = float(m.group(1))
 
+    if retire_samples == 0 and not summaries:
+        raise NoStatsError("no retire lines or end-of-run stats block")
+    summary_ipc, summary_retired, summary_cycles = summaries[min(summaries)] if summaries else (None, None, None)
     if retire_samples > 0:
         if first_cycle is None:
             first_cycle = 0
@@ -82,7 +93,7 @@ def extract_stats(lines: Iterable[str]) -> dict:
         last_cycle = summary_cycles or 0
         total_cycles = summary_cycles or 0
         total_instructions = summary_retired or 0
-        ipc = summary_ipc if summary_ipc is not None else 0.0
+        ipc = total_instructions / total_cycles if total_cycles else (summary_ipc or 0.0)
         last_tag = max(total_instructions - 1, 0)
 
     return {
@@ -147,18 +158,22 @@ def write_csv(stats: dict, setup_time: float, log_path: Path, csv_path: Path):
 
 def main():
     parser = argparse.ArgumentParser(description="Parse RPM simulation stats")
-    parser.add_argument("path", help="Path to sim.log or directory containing it")
+    parser.add_argument("path", help="Path to a sim log, or a run_sim.sh output dir (reads ilog.txt)")
     parser.add_argument("--csv", help="Append results to a CSV file", default=None)
     args = parser.parse_args()
 
     p = Path(args.path)
     if p.is_dir():
-        p = p / "sim.log"
+        p = p / "ilog.txt"
     if not p.exists():
         print(f"Error: {p} not found", file=sys.stderr)
         sys.exit(1)
 
-    stats = parse_retire_lines(p)
+    try:
+        stats = parse_retire_lines(p)
+    except NoStatsError as e:
+        print(f"Error: {p}: {e}", file=sys.stderr)
+        sys.exit(1)
     setup_time = parse_setup_time(p)
     print_stats(stats, setup_time, p)
 

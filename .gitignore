@@ -14,9 +14,16 @@ ilog*.txt
 *.ans
 pipeline*.txt
 *.dbg
+results/
 
 # Python
 __pycache__/
 *.pyc
 
 .cursor/
+.cache/
+compile_commands.json
+
+# Locally-built test programs
+tests/programs/
+tests/accel/*.elf

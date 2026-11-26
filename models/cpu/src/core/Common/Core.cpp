@@ -18,7 +18,6 @@ Core::Core(sparta::TreeNode* node, const CoreParams* params)
     (void)static_cast<std::string>(params->visualizer_format);
     (void)static_cast<std::string>(params->visualizer_output_file);
     (void)static_cast<bool>(params->visualizer_color);
-    (void)static_cast<bool>(params->visualizer_streaming);
     (void)static_cast<bool>(params->visualizer_debug_enabled);
     (void)static_cast<std::string>(params->visualizer_debug_file);
     (void)static_cast<uint64_t>(params->visualizer_debug_start_cycle);

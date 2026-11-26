@@ -13,9 +13,13 @@
 
 #include "Common/PipelinePacket.hpp"
 #include "Common/PipelineVisualizer.hpp"
+#include "Common/SpeculationConfig.hpp"
 
 namespace cpu {
 class ExecutionDriver;
+}
+namespace core {
+class Mmu;
 }
 
 namespace frontend {
@@ -29,6 +33,7 @@ class FetchStructuresParams : public sparta::ParameterSet {
     PARAMETER(uint64_t, initial_pc, 0x80000000, "Initial program counter")
     PARAMETER(uint32_t, fetch_width, 4, "Number of bytes fetched per cycle")
     PARAMETER(uint32_t, fetch_buffer_capacity, 64, "Fetch buffer capacity in bytes")
+    PARAMETER(uint32_t, max_branches_per_fetch, 2, "Branches the predictor handles per fetch group; a group ends at the last one")
 };
 
 class FetchStructures : public sparta::Unit {
@@ -52,15 +57,24 @@ class FetchStructures : public sparta::Unit {
     // Correct branch resolution - decrements depth without redirect
     sparta::DataInPort<core::BranchResolved> branch_resolved_in{&unit_port_set_, "branch_resolved_in"};
 
+    // Cycles to stall before a predicted-taken branch steers fetch
+    sparta::DataInPort<uint32_t> taken_bubble_in{&unit_port_set_, "taken_bubble_in"};
+
     void tick();
     void setCache(frontend::FrontendMemoryStructures* cache) { mCache = cache; }
+    void setMmu(core::Mmu* mmu) { mMmu = mmu; }
     void setExecutionDriver(cpu::ExecutionDriver* d) { mDriver = d; }
     void setVisualizer(core::PipelineVisualizer* v) { mVis = v; }
     void setMispredictionPenalty(uint32_t cycles) { mMispredictionPenalty = cycles; }
+    void setSpeculationConfig(const core::SpeculationConfig* cfg) { mSpecCfg.set(cfg); }
+    // A target predictor redirects only where it differs from Whisper, so the wrong path
+    // must take Whisper's branches too; without one it runs straight through them.
+    void setFollowWrongPathBranches(bool on) { mFollowWrongPathBranches = on; }
 
     uint64_t numFetched() const { return mNumFetched.get(); }
     uint64_t numBufferFullStallCycles() const { return mNumBufferFullStallCycles.get(); }
     uint64_t numRedirects() const { return mNumRedirects.get(); }
+    uint64_t nextFetchSeq() const { return mFetchSeq; }
 
    private:
     void sendRequest(uint64_t base_pc, std::vector<core::PipelinePacket>&& packets);
@@ -68,47 +82,30 @@ class FetchStructures : public sparta::Unit {
     void receiveBpRedirect_(const core::PredictedRedirect& redirect);
     void receiveMispredRedirect_(const core::BranchRedirect& redirect);
     void receiveBranchResolved_(const core::BranchResolved& resolved);
+    void receiveTakenBubble_(const uint32_t& cycles);
+    void cancelInFlight_(uint64_t branch_tag, uint8_t branch_depth, core::FlushSource source);
 
     cpu::ExecutionDriver* mDriver{nullptr};
     uint64_t mPc;
     uint32_t mFetchWidth;
     uint32_t mFetchBufferCapacity;
+    uint32_t mMaxBranchesPerFetch;
     bool mFirstFetch{true};
     frontend::FrontendMemoryStructures* mCache = nullptr;
+    core::Mmu* mMmu = nullptr;
+    // Last MSHR pre-check translation, so a stalled fetch block is not re-walked every cycle.
+    uint64_t mPrecheckVa{0};
+    uint64_t mPrecheckPa{0};
 
     core::PipelineVisualizer* mVis{nullptr};
+    core::SpeculationConfigRef mSpecCfg;
 
     // Wrong-path speculation tracking
     uint8_t mCurrentWrongPathDepth{0};  // Current speculation depth (0 = correct path)
     bool mOnSpeculativePath{false};     // True when fetching from BP-predicted path
     uint64_t mSpeculativePc{0};         // PC to fetch from when on speculative path
     uint64_t mCurrentSpecBranchTag{0};  // Branch tag that caused current speculation level (for BranchResolved filtering)
-
-    // Filter state for stale BP/mispred redirects after a misprediction recovery.
-    // Updated atomically by receiveMispredRedirect_ when a recovery commits.
-    //
-    // Why two thresholds (squash vs depth0)? Speculative recoveries (depth>0)
-    // invalidate everything fetched before them, but they do NOT invalidate
-    // depth=0 branches that were fetched even earlier — only depth=0 recoveries
-    // can flush depth=0 branches. So depth=0 mispred filtering uses its own pair
-    // (depth0_fetch_seq + depth0_branch_fetch_seq) instead of the general threshold.
-    struct StaleRedirectFilter {
-        // Fetch-seq threshold updated by ANY mispred recovery. Used to filter BP
-        // redirects and depth>0 mispred redirects. Branches with fetch_seq < this
-        // are from squashed paths.
-        uint64_t squash_threshold_fetch_seq{0};
-
-        // Fetch frontier at the most recent depth=0 recovery (upper bound of its
-        // squashed window).
-        uint64_t depth0_fetch_seq{0};
-
-        // Fetch-seq of the most recent depth=0 recovery's branch (lower bound of its
-        // squashed window). A depth=0 mispred is stale iff its branch was fetched
-        // strictly between this and depth0_fetch_seq -- i.e. on that recovery's
-        // squashed path. Monotonic and never reused (unlike the model tag).
-        uint64_t depth0_branch_fetch_seq{0};
-    };
-    StaleRedirectFilter mStaleFilter;
+    bool mFollowWrongPathBranches{false};
 
     // Monotonic fetch-sequence counter (never reset, globally unique). Liveness/
     // ordering key for stale-redirect filtering; the visualizer also consumes it.
@@ -117,11 +114,16 @@ class FetchStructures : public sparta::Unit {
     // Static misprediction penalty (used when wrong_path_enabled=false)
     uint32_t mMispredictionPenalty{0};  // Configured penalty cycles
     uint32_t mMispredStallCycles{0};    // Remaining stall cycles (counts down)
+    bool mAwaitingResolve{false};       // holding at a mispredicted branch until its redirect
+    uint32_t mTakenBubbleCycles{0};
+    uint64_t mMispredRedirectCycle{~0ULL};
 
     sparta::Counter mNumFetched;
     sparta::Counter mNumBufferFullStallCycles;
     sparta::Counter mNumRedirects;
     sparta::Counter mNumMispredPenaltyStalls;
+    sparta::Counter mNumBranchLimitEnds;
+    sparta::Counter mNumTakenBubbleCycles;
 };
 
 }  // namespace frontend

@@ -39,11 +39,12 @@ inline bool frontendShouldSquash(uint64_t tag, uint8_t depth, const core::FlushR
 FetchQueue::FetchQueue(sparta::TreeNode* node, const FetchQueueParams* params)
     : sparta::Unit(node),
       mCapacity(params->capacity),
-      mLogEnabled(params->log_enabled),
+      mLatency(params->latency),
       mNumEnqueued(&unit_stat_set_, "num_enqueued", "Packets enqueued", sparta::Counter::COUNT_NORMAL),
       mNumDequeued(&unit_stat_set_, "num_dequeued", "Packets pulled by Decode", sparta::Counter::COUNT_NORMAL),
       mNumFullStallCycles(&unit_stat_set_, "full_stall_cycles", "Cycles stalled due to full queue", sparta::Counter::COUNT_NORMAL),
-      mNumBranchWaitCycles(&unit_stat_set_, "branch_wait_cycles", "Cycles head-of-queue blocked on prediction", sparta::Counter::COUNT_NORMAL) {
+      mNumBranchWaitCycles(&unit_stat_set_, "branch_wait_cycles", "Cycles head-of-queue blocked on prediction", sparta::Counter::COUNT_NORMAL),
+      mNumLatencyWaitCycles(&unit_stat_set_, "latency_wait_cycles", "Cycles the head of the queue was still in predecode", sparta::Counter::COUNT_NORMAL) {
     packets_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(FetchQueue, receivePackets_, std::vector<core::PipelinePacket>));
     branch_predict_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(FetchQueue, receivePrediction_, core::BranchPrediction));
     flush_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(FetchQueue, receiveFlush_, core::FlushRequest));
@@ -169,6 +170,7 @@ void FetchQueue::receivePackets_(const std::vector<core::PipelinePacket>& pkts) 
                       "[FetchQueue] Queue overflow - backpressure should prevent this! queue_size=" << mQueue.size() << " capacity=" << mCapacity);
         Entry entry;
         entry.pkt = pkt;
+        entry.ready_cycle = current_cycle + mLatency;
         bool is_branch = (pkt.inst_class == cpu::InstClass::Branch || pkt.inst_class == cpu::InstClass::Jump);
         entry.needs_branch_prediction = is_branch;
 
@@ -223,7 +225,9 @@ void FetchQueue::tick() {
     // Track branch wait cycles if head is blocked
     if (!mQueue.empty()) {
         auto& entry = mQueue.front();
-        if (entry.needs_branch_prediction && !entry.has_branch_prediction) {
+        if (!hasReady()) {
+            ++mNumLatencyWaitCycles;
+        } else if (entry.needs_branch_prediction && !entry.has_branch_prediction) {
             ++mNumBranchWaitCycles;
             ILOG("[fetch_queue] head blocked: waiting for prediction tag=" << entry.pkt.tag);
         }
@@ -231,7 +235,7 @@ void FetchQueue::tick() {
 }
 
 FetchQueue::Entry FetchQueue::pullOne() {
-    sparta_assert(!mQueue.empty(), "[FetchQueue] pullOne called on empty queue");
+    sparta_assert(hasReady(), "[FetchQueue] pullOne called with no entry past predecode");
 
     auto& entry = mQueue.front();
 

@@ -34,12 +34,14 @@ class WritePortArbiter;
 
 namespace core {
 class FlushArbiter;
+class Mmu;
 class PipelineVisualizer;
 }  // namespace core
 
 namespace memory {
 class L2Cache;
-}
+class Dram;
+}  // namespace memory
 
 namespace core {
 
@@ -62,6 +64,8 @@ class PipelineClock : public sparta::Unit {
 
     void setArbiter(midcore::WritePortArbiter* arb) { mArbiter = arb; }
     void setL2(memory::L2Cache* l2) { mL2 = l2; }
+    void setDram(memory::Dram* dram) { mDram = dram; }
+    void setMmu(core::Mmu* mmu) { mMmu = mmu; }
     void setFlushArbiter(core::FlushArbiter* fa) { mFlushArbiter = fa; }
     void setVisualizer(core::PipelineVisualizer* v) { mVisualizer = v; }
 
@@ -86,7 +90,7 @@ class PipelineClock : public sparta::Unit {
     std::chrono::steady_clock::time_point mLastReportTime{};
 
     static constexpr uint64_t kReportInterval = 1000000;
-    static constexpr uint64_t kDeadlockThreshold = 1000;
+    static constexpr uint64_t kDeadlockThreshold = 10000;  // above a DRAM miss queued behind a refresh
 
     frontend::FetchStructures* mFetch = nullptr;
     frontend::FrontendMemoryStructures* mMemory = nullptr;
@@ -102,6 +106,8 @@ class PipelineClock : public sparta::Unit {
     midcore::Writeback* mWriteback = nullptr;
     midcore::WritePortArbiter* mArbiter = nullptr;
     memory::L2Cache* mL2 = nullptr;
+    memory::Dram* mDram = nullptr;
+    core::Mmu* mMmu = nullptr;
     core::FlushArbiter* mFlushArbiter = nullptr;
     core::PipelineVisualizer* mVisualizer = nullptr;
 };

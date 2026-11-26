@@ -6,16 +6,16 @@
 """Compare statistics from two RPM simulation runs.
 
 Usage:
-    python compare_runs.py <run_a_dir> <run_b_dir>
-    python compare_runs.py <run_a.log> <run_b.log>
-    python compare_runs.py <run_a.log> <run_b.log> --threshold 5.0
+    python3 compare_runs.py <run_a_dir> <run_b_dir>
+    python3 compare_runs.py <run_a.log> <run_b.log>
+    python3 compare_runs.py <run_a.log> <run_b.log> --threshold 5.0
 """
 
 import argparse
 import sys
 from pathlib import Path
 
-from parse_stats import parse_retire_lines
+from parse_stats import NoStatsError, parse_retire_lines
 
 
 def pct_change(a: float, b: float) -> float:
@@ -82,7 +82,7 @@ def main():
     def resolve_log(p: str) -> Path:
         path = Path(p)
         if path.is_dir():
-            path = path / "sim.log"
+            path = path / "ilog.txt"  # run_sim.sh output dir
         if not path.exists():
             print(f"Error: {path} not found", file=sys.stderr)
             sys.exit(1)
@@ -91,8 +91,15 @@ def main():
     log_a = resolve_log(args.run_a)
     log_b = resolve_log(args.run_b)
 
-    stats_a = parse_retire_lines(log_a)
-    stats_b = parse_retire_lines(log_b)
+    def load(path: Path) -> dict:
+        try:
+            return parse_retire_lines(path)
+        except NoStatsError as e:
+            print(f"Error: {path}: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    stats_a = load(log_a)
+    stats_b = load(log_b)
 
     print(f"Run A: {log_a}")
     print(f"Run B: {log_b}")

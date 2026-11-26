@@ -6,6 +6,7 @@
 instr_size: 4
 
 # Optional: path to ELF for ExecutionDriver/Whisper (if set, fetch is driven by Whisper ISS).
+# The ELF argument (`simple TICKS ELF`, run_sim.sh -e) overrides it.
 # Build test ELFs: make -C tests
 target_command: ""
 

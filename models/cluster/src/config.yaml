@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
+
+# Cluster configuration template.
+#
+# The cluster wires a set of droppable cores to one shared cluster cache via the
+# standardized memory interface. Here the dropped-in core is the out-of-order core
+# from models/cpu/src/core (external last-level cache). Cores are defined by the
+# REQUIRED cpu_types + cores schema below (there is no implicit num_cpus mode).
+
+# ---- Cluster (generic) ----
+cache_hit_latency: 12               # shared cluster cache hit latency (cycles)
+cache_miss_latency: 100             # shared cluster cache miss latency to backing memory (cycles)
+cluster_cache_size_kb: 2048         # shared cluster cache capacity (2 MB LLC)
+cluster_cache_associativity: 8      # shared cluster cache ways
+line_size: 64                       # cache line size (bytes)
+coherence_enabled: true             # MSI directory: snoop-invalidate sharers, grant S/M
+coherence_latency: 0                 # extra cycles for a coherence transaction (invalidate remote
+                                     # sharers / fetch an owned line); added to the grant latency
+
+# ---- CPU types + core assignment (REQUIRED) ----
+# A type is a name + its core CPU config file. `cores` assigns types to hart ids;
+# This default is a single type on 3 cores; see config_heterogeneous.yaml for a mix.
+cpu_types:
+  core:
+    core_config: core_config.yaml   # this core's CPU config
+    # cpu_freq: 3.0                  # optional per-type clock GHz (0/omit => inherit)
+cores:
+  - { type: core, hartids: "0-2" }  # 3 cores on harts 0,1,2 (or use `count: 3`)
+#
+# Note: in ELF/snapshot mode (shared multi-hart Whisper) hartids must be contiguous
+# 0..N-1 (harts are restored positionally). Single-hart snapshots allow arbitrary hartids.
+
+# core_config (top level): optional fallback used only by a cpu_type that omits its own
+# core_config. Kept for convenience; the per-type file is the normal place.
+core_config: "core_config.yaml"
+
+# Workload (pick one):
+program: ""               # ELF to execute on each core ("" = no ELF workload)
+snapshot: ""              # Whisper snapshot directory; execution-driven.
+                          # Topology inferred from the snapshot: multi-hart (registers0..N-1)
+                          # => one shared Whisper; single-hart => independent Whisper per core
+instruction_limit: 0      # 0 = no limit; the run ends when any core's program exits or
+                          # commits the ROI-exit HINT (addi x0, x12, imm)
+
+# Set true to stream per-unit activity (ILOG) to stdout.
+verbose: false

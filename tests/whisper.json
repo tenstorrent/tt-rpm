@@ -1,6 +1,6 @@
 {
     "xlen": 64,
-    "isa": "rv64imac",
+    "isa": "rv64imafdc",
     "enable_misaligned_data": "true",
     "memmap": {
         "inst": [["0x80000000", "0x801fffff"]],
@@ -8,12 +8,12 @@
             {
                 "low": "0x80000000",
                 "high": "0x801fffff",
-                "attribs": ["read", "write", "exec", "amo", "rsrv", "idempotent"]
+                "attribs": ["read", "write", "exec", "amo", "rsrv", "idempotent", "misal_ok"]
             },
             {
                 "low": "0x0",
                 "high": "0xffffffffffffffff",
-                "attribs": ["read", "write", "amo", "rsrv", "idempotent"]
+                "attribs": ["read", "write", "amo", "rsrv", "idempotent", "misal_ok"]
             }
         ]
     }

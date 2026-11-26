@@ -29,16 +29,26 @@ class DecodeStructuresParams : public sparta::ParameterSet {
     DecodeStructuresParams(sparta::TreeNode* n)
         : sparta::ParameterSet(n) {}
 
+    PARAMETER(uint32_t, decode_width, 4, "Instructions decoded per cycle")
+
     PARAMETER(uint32_t, lat_alu, 1, "ALU latency")
     PARAMETER(uint32_t, lat_mul, 3, "Multiply latency")
-    PARAMETER(uint32_t, lat_div, 12, "Divide latency")
+    // Divide and FP defaults follow public x86 and Rocket latencies; CONFIG_README names the sources.
+    PARAMETER(uint32_t, lat_div, 14, "Divide latency")
     PARAMETER(uint32_t, lat_branch, 1, "Branch latency")
     PARAMETER(uint32_t, lat_load, 1, "Load execution latency (cache latency is separate)")
     PARAMETER(uint32_t, lat_store, 1, "Store execution latency")
-    PARAMETER(uint32_t, lat_fp, 4, "Floating-point latency")
+    PARAMETER(uint32_t, lat_fp, 4, "Latency of FP ops outside the classes below")
+    PARAMETER(uint32_t, lat_fp_add, 3, "FP add and subtract latency")
+    PARAMETER(uint32_t, lat_fp_mul, 4, "FP multiply latency")
+    PARAMETER(uint32_t, lat_fp_fma, 4, "FP fused multiply-add latency")
+    PARAMETER(uint32_t, lat_fp_cvt, 4, "FP convert latency: to and from integer, and between formats")
+    PARAMETER(uint32_t, lat_fp_cmp, 2, "FP compare, min and max latency")
+    PARAMETER(uint32_t, lat_fp_move, 2, "FP sign-injection, move and classify latency")
+    PARAMETER(uint32_t, lat_fp_div_s, 10, "Half- and single-precision FP divide and square-root latency (vector: SEW <= 32)")
+    PARAMETER(uint32_t, lat_fp_div_d, 13, "Double-precision FP divide and square-root latency (vector: SEW 64)")
     PARAMETER(uint32_t, lat_vec, 4, "Vector operation latency")
     PARAMETER(uint32_t, lat_fence, 1, "Fence latency")
-    PARAMETER(uint32_t, bp_mispred_penalty, 5, "Decode stall cycles on branch misprediction")
 };
 
 class DecodeStructures : public sparta::Unit {
@@ -59,6 +69,9 @@ class DecodeStructures : public sparta::Unit {
     // Flush input port
     sparta::DataInPort<core::FlushRequest> flush_in{&unit_port_set_, "flush_in"};
 
+    // Misfetch redirect to FlushArbiter
+    sparta::DataOutPort<core::FlushRequest> misfetch_flush_out{&unit_port_set_, "misfetch_flush_out"};
+
     void tick();
 
     // Set upstream FetchQueue (pull model, used when queues are not bypassed)
@@ -73,7 +86,7 @@ class DecodeStructures : public sparta::Unit {
     void setDirectMode(bool enabled) { mDirectMode = enabled; }
 
     uint64_t numDecoded() const { return mNumDecoded.get(); }
-    uint64_t numMispredStallCycles() const { return mNumMispredStallCycles.get(); }
+    size_t numPendingPackets() const { return mPendingPackets.size(); }
     uint64_t numBranchWaitCycles() const { return mNumBranchWaitCycles.get(); }
 
    private:
@@ -81,9 +94,14 @@ class DecodeStructures : public sparta::Unit {
     void receivePackets_(const std::vector<core::PipelinePacket>& pkts);
     void receiveBranchPrediction_(const core::BranchPrediction& pred);
 
-    static core::UopType classifyUop(cpu::InstClass ic);
+    static core::UopType classifyUop(const core::PipelinePacket& pkt);
+    uint8_t latencyFor_(const core::PipelinePacket& pkt, core::UopType t) const;
+    bool redirectMisfetch_(const core::BranchPrediction& pred, core::DecodePacket& dp);
 
     std::array<uint8_t, core::kNumUopTypes> mLatencyTable{};
+    std::array<uint8_t, 8> mFpLatency{};  // by core::FpOpClass
+    uint8_t mLatFpDivS;
+    uint8_t mLatFpDivD;
 
     frontend::FetchQueue* mFetchQueue{nullptr};
     frontend::DecodeQueue* mDecodeQueue{nullptr};
@@ -95,14 +113,13 @@ class DecodeStructures : public sparta::Unit {
 
     core::PipelineVisualizer* mVis{nullptr};
 
-    uint32_t mMispredPenalty{5};
-    uint32_t mMispredStall{0};
-    bool mRestartAfterMispredStall{false};  // Tag the next delivered uop as ending a misprediction stall
+    uint32_t mDecodeWidth;
     bool mDirectMode{false};
 
     sparta::Counter mNumDecoded;
-    sparta::Counter mNumMispredStallCycles;
     sparta::Counter mNumBranchWaitCycles;
+    sparta::Counter mNumMisfetchRedirects;
+    sparta::Counter mNumWidthLimitedCycles;
 };
 
 }  // namespace frontend

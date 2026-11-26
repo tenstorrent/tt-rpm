@@ -76,18 +76,17 @@ index b221363..c9d261b 100644
  /* Configuration : MAIN_HAS_NORETURN
 diff --git a/barebones/crt0.S b/barebones/crt0.S
 new file mode 100644
-index 0000000..f57a2f7
+index 0000000..1aa9ecf
 --- /dev/null
 +++ b/barebones/crt0.S
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,54 @@
 +# Minimal bare-metal startup for CoreMark on the RPM core model.
 +# No OS, no syscalls. Set up gp/sp, clear .bss, call main(), then exit via the
 +# HTIF "tohost" protocol. Console output also goes through tohost (see
 +# ee_printf.c). The model routes tohost stores to stdout / sim-stop.
 +
 +    .section .text.init, "ax"
-+    .global _start
-+_start:
++_start_hart0:
 +    .option push
 +    .option norelax
 +    la      gp, __global_pointer$
@@ -112,6 +111,18 @@ index 0000000..f57a2f7
 +    sd      t1, 0(t0)
 +3:
 +    j       3b
++
++    # Entry: harts other than 0 park, as every hart would share the one stack and .bss.
++    # link.ld places this after the image so it does not move the benchmark's code or data.
++    .section .entry, "ax"
++    .global _start
++_start:
++    csrr    t0, mhartid
++    bnez    t0, 1f
++    j       _start_hart0
++1:
++    wfi
++    j       1b
 +
 +    # HTIF mailbox. Whisper looks these up by symbol name ("tohost"/"fromhost").
 +    .section .tohost, "aw", @progbits
@@ -163,10 +174,10 @@ index f2d362d..0232e47 100644
  int
 diff --git a/barebones/link.ld b/barebones/link.ld
 new file mode 100644
-index 0000000..7cdeca1
+index 0000000..c7db7ef
 --- /dev/null
 +++ b/barebones/link.ld
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,46 @@
 +/* Bare-metal layout for the RPM core model.
 + * Everything lives in the executable region based at 0x80000000
 + * (matches the exec PMA region in tests/whisper.json). */
@@ -211,4 +222,5 @@ index 0000000..7cdeca1
 +    _stack_top = .;
 +
 +    .tohost : { *(.tohost) }
++    .entry : { *(.entry) }
 +}

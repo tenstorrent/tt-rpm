@@ -7,18 +7,13 @@
 #include <string>
 
 #include "sparta/app/Simulation.hpp"
-#include "sparta/simulation/TreeNode.hpp"
 
-#include "Common/BypassNetwork.hpp"
-#include "Common/PipelineVisualizer.hpp"
-#include "Common/WritePortArbiter.hpp"
-#include "Common/WritebackBuffer.hpp"
-#include "MemoryHierarchy/CacheTracer.hpp"
+#include "Common/CoreImpl.hpp"
 
-namespace cpu {
-class ExecutionDriver;
-}
-
+// Single-core OOO simulation.  All of the build/wire logic lives in the reusable
+// core::CoreImpl (shared with the cluster); ChipSim is just the Simulation
+// shell that drives one CoreImpl (with a private L2 backing) across the
+// standard Sparta phases.
 class ChipSim : public sparta::app::Simulation {
    public:
     ChipSim(sparta::Scheduler* scheduler);
@@ -31,31 +26,15 @@ class ChipSim : public sparta::app::Simulation {
     void run(uint64_t run_time) override;
 
     void setTargetCommandOverride(const std::string& path) { mTargetCommandOverride = path; }
-    void setTraceFilenameOverride(const std::string& path) { mTraceFilenameOverride = path; }
+    void setSnapshotOverride(const std::string& path) { mSnapshotOverride = path; }
     void setInstructionLimit(uint64_t limit) { mInstructionLimit = limit; }
     void setCpuFreqGHz(double freq) { mCpuFreqGHz = freq; }
 
    private:
-    void initExecutionDriver(const std::string& target_command, const std::string& trace_filename);
-    void bindCore(sparta::TreeNode* core_tn);
-
-    cpu::ExecutionDriver* mExecutionDriver = nullptr;
-
-    // Non-Unit objects owned by the simulation
-    std::unique_ptr<core::PipelineVisualizer> mVisualizer;
-    std::unique_ptr<midcore::WritePortArbiter> mWritePortArbiter;
-    std::unique_ptr<midcore::BypassNetwork> mBypassNetwork;
-    std::unique_ptr<midcore::WritebackBuffer> mWritebackBuffer;
-
-    std::unique_ptr<cpu::CacheTracer> mIcacheTracer;
-    std::unique_ptr<cpu::CacheTracer> mDcacheTracer;
-    std::unique_ptr<cpu::CacheTracer> mL2Tracer;
+    std::unique_ptr<core::CoreImpl> mCore;
 
     std::string mTargetCommandOverride;
-    std::string mTraceFilenameOverride;
+    std::string mSnapshotOverride;
     uint64_t mInstructionLimit{0};
     double mCpuFreqGHz{0};
-
-    std::string mCacheViewerFormat{"log"};
-    std::string mCacheViewerOutfile{"stderr"};
 };

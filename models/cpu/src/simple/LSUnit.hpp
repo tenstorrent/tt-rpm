@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <algorithm>
 #include <deque>
+#include <utility>
 
 #include "sparta/ports/DataPort.hpp"
 #include "sparta/simulation/Unit.hpp"
@@ -34,12 +36,8 @@ class LSUnit : public sparta::Unit {
         ILOG("[ls] cycle " << getClock()->currentCycle() << " received operation pc=0x" << std::hex << op.pc << std::dec << " is_mem=" << op.is_mem
                            << " addr=0x" << op.mem_addr);
         if (mExecutionDriver) {
-            if (op.is_mem) {
-                mPendingRetireTags.push_back(op.driver_tag);
-            } else {
-                ILOG("[ls] cycle " << getClock()->currentCycle() << " retiring non-mem tag " << op.driver_tag << " pc=0x" << std::hex << op.pc << std::dec);
-                mExecutionDriver->retireInstruction(op.driver_tag);
-            }
+            mInFlight.push_back({op.driver_tag, !op.is_mem});
+            retireCompleted();
         }
         if (op.is_mem) {
             MemRequest req;
@@ -54,14 +52,23 @@ class LSUnit : public sparta::Unit {
     void handleResp(const MemResponse& resp) {
         ILOG("[ls] cycle " << getClock()->currentCycle() << " received response data 0x" << std::hex << resp.data << std::dec
                            << " -- execution complete (simple pipeline)");
-        if (mExecutionDriver && !mPendingRetireTags.empty()) {
-            uint64_t tag = mPendingRetireTags.front();
-            mPendingRetireTags.pop_front();
-            ILOG("[ls] cycle " << getClock()->currentCycle() << " retiring mem tag " << tag << " (response received)");
-            mExecutionDriver->retireInstruction(tag);
+        if (mExecutionDriver) {
+            // Responses return in request order, so this completes the oldest outstanding mem op.
+            auto it = std::find_if(mInFlight.begin(), mInFlight.end(), [](const auto& e) { return !e.second; });
+            if (it != mInFlight.end()) it->second = true;
+            retireCompleted();
+        }
+    }
+
+    // ExecutionDriver requires program-order retirement: a non-mem op waits behind older mem ops.
+    void retireCompleted() {
+        while (!mInFlight.empty() && mInFlight.front().second) {
+            ILOG("[ls] cycle " << getClock()->currentCycle() << " retiring tag " << mInFlight.front().first);
+            mExecutionDriver->retireInstruction(mInFlight.front().first);
+            mInFlight.pop_front();
         }
     }
 
     cpu::ExecutionDriver* mExecutionDriver = nullptr;
-    std::deque<uint64_t> mPendingRetireTags;
+    std::deque<std::pair<uint64_t, bool>> mInFlight;  // (driver tag, completed), program order
 };

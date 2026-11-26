@@ -24,8 +24,8 @@ class FetchQueueParams : public sparta::ParameterSet {
     FetchQueueParams(sparta::TreeNode* n)
         : sparta::ParameterSet(n) {}
 
-    PARAMETER(uint32_t, capacity, 16, "FetchQueue capacity (entries)")
-    PARAMETER(bool, log_enabled, false, "Enable debug logging for this unit")
+    PARAMETER(uint32_t, capacity, 32, "FetchQueue capacity (entries)")
+    PARAMETER(uint32_t, latency, 1, "Predecode/align stages between the I-cache and Decode (0 = Decode takes an instruction the cycle it arrives)")
 };
 
 class FetchQueue : public sparta::Unit {
@@ -46,18 +46,21 @@ class FetchQueue : public sparta::Unit {
         bool needs_branch_prediction{false};
         bool has_branch_prediction{false};
         core::BranchPrediction branch_pred;
+        uint64_t ready_cycle{0};
     };
 
     void tick();
 
     // Pull model: Decode calls these methods
-    const Entry* peek() const { return mQueue.empty() ? nullptr : &mQueue.front(); }
+    const Entry* peek() const { return hasReady() ? &mQueue.front() : nullptr; }
     Entry pullOne();  // Pull single packet from head
 
-    bool isEmpty() const { return mQueue.empty(); }
+    // The head has cleared the predecode latency.
+    bool hasReady() const { return !mQueue.empty() && mQueue.front().ready_cycle <= getClock()->currentCycle(); }
     bool isReady() const { return mQueue.size() < mCapacity; }
     size_t available() const { return mCapacity - mQueue.size(); }
     size_t size() const { return mQueue.size(); }
+    size_t capacity() const { return mCapacity; }
     void setVisualizer(core::PipelineVisualizer* v) { mVis = v; }
     void flush();
 
@@ -65,6 +68,7 @@ class FetchQueue : public sparta::Unit {
     uint64_t numDequeued() const { return mNumDequeued.get(); }
     uint64_t numFullStallCycles() const { return mNumFullStallCycles.get(); }
     uint64_t numBranchWaitCycles() const { return mNumBranchWaitCycles.get(); }
+    uint64_t numLatencyWaitCycles() const { return mNumLatencyWaitCycles.get(); }
 
    private:
     void receivePackets_(const std::vector<core::PipelinePacket>& pkts);
@@ -90,13 +94,14 @@ class FetchQueue : public sparta::Unit {
     uint64_t mExeSquashCycle{0};
 
     uint32_t mCapacity;
+    uint32_t mLatency;
     core::PipelineVisualizer* mVis{nullptr};
-    bool mLogEnabled{false};
 
     sparta::Counter mNumEnqueued;
     sparta::Counter mNumDequeued;
     sparta::Counter mNumFullStallCycles;
     sparta::Counter mNumBranchWaitCycles;
+    sparta::Counter mNumLatencyWaitCycles;
 };
 
 }  // namespace frontend

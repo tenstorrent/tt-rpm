@@ -6,8 +6,10 @@
 #include <cstdint>
 #include <list>
 #include <unordered_map>
+#include <vector>
 
 #include "Common/PipelinePacket.hpp"
+#include "LoadStoreUnit/StoreQueue.hpp"
 #include "MemoryHierarchy/Cache.hpp"
 
 namespace midcore {
@@ -15,8 +17,8 @@ namespace midcore {
 // ─────────────────────────────────────────────────────────────────────────────
 // LoadQueue — non-Sparta helper class for the LSU.
 //
-// Holds in-flight load instructions waiting for D-cache responses.
-// Supports store-to-load forwarding queries and write-port arbitration.
+// Holds load instructions from execute to retire, so a store whose address
+// resolves late can find younger loads that already read stale data.
 // ─────────────────────────────────────────────────────────────────────────────
 
 class LoadQueue {
@@ -25,12 +27,23 @@ class LoadQueue {
         core::IssuePacket ipkt;
         cpu::address_t address{0};
         uint8_t access_size{4};
+        std::vector<cpu::address_t> lines;  // cache lines touched, requested in order
+        std::vector<MemRange> ranges{};     // bytes read
+        uint32_t next_line{0};
+        uint32_t responses_pending{0};
+        uint64_t req_id{0};             // shared by this load's D-cache accesses
         bool address_known{false};      // EA computed
         bool request_sent{false};       // sent to D-cache
         bool response_received{false};  // D-cache responded
         bool forwarded{false};          // satisfied by store buffer/SQ
         bool written_back{false};       // won write port
         uint32_t forward_cycles{0};     // countdown for forwarding latency
+        uint64_t fwd_store_tag{0};      // store-queue entry forwarded from
+        bool fwd_from_sq{false};
+        uint64_t dep_store_seq{UINT64_MAX};  // store the store-set predictor makes it wait for
+        bool committed{false};               // ROB has retired this load
+        bool violation{false};               // read before an older overlapping store's address was known
+        uint8_t waits_counted{0};            // LSQ::WaitReason bits already counted for this load
     };
 
     explicit LoadQueue(uint32_t capacity)
@@ -42,9 +55,10 @@ class LoadQueue {
     uint32_t capacity() const { return mCapacity; }
 
     // Enqueue a new load
-    void enqueue(const core::IssuePacket& ipkt, cpu::address_t addr, uint8_t size) {
-        mEntries.emplace_back(Entry{.ipkt = ipkt, .address = addr, .access_size = size, .address_known = true});
+    Entry& enqueue(const core::IssuePacket& ipkt, cpu::address_t addr, uint8_t size, std::vector<cpu::address_t> lines) {
+        mEntries.emplace_back(Entry{.ipkt = ipkt, .address = addr, .access_size = size, .lines = std::move(lines), .address_known = true});
         mTagIndex[ipkt.pkt.tag] = std::prev(mEntries.end());
+        return mEntries.back();
     }
 
     // Find entry by tag (O(1) via tag index)
@@ -111,10 +125,10 @@ class LoadQueue {
         }
     }
 
-    // Check if entry with given tag is ready to remove (response received and written back)
+    // Check if entry with given tag is ready to remove (written back and retired)
     bool canRemove(uint64_t tag) const {
         if (const auto* e = find(tag)) {
-            return (e->response_received || e->forwarded) && e->written_back;
+            return (e->response_received || e->forwarded) && e->written_back && e->committed;
         }
         return false;
     }

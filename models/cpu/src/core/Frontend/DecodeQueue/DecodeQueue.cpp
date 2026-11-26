@@ -15,10 +15,12 @@ namespace frontend {
 DecodeQueue::DecodeQueue(sparta::TreeNode* node, const DecodeQueueParams* params)
     : sparta::Unit(node),
       mCapacity(params->capacity),
-      mLogEnabled(params->log_enabled),
+      mLatency(params->latency),
       mNumEnqueued(&unit_stat_set_, "num_enqueued", "Uops enqueued", sparta::Counter::COUNT_NORMAL),
       mNumDequeued(&unit_stat_set_, "num_dequeued", "Uops pulled by Rename", sparta::Counter::COUNT_NORMAL),
-      mNumFullStallCycles(&unit_stat_set_, "full_stall_cycles", "Cycles stalled due to full queue", sparta::Counter::COUNT_NORMAL) {
+      mNumFullStallCycles(&unit_stat_set_, "full_stall_cycles", "Cycles stalled due to full queue", sparta::Counter::COUNT_NORMAL),
+      mNumLatencyWaitCycles(&unit_stat_set_, "latency_wait_cycles", "Cycles the head of the queue was still in the decode-to-rename latency",
+                            sparta::Counter::COUNT_NORMAL) {
     decode_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(DecodeQueue, receiveDecodePackets_, std::vector<core::DecodePacket>));
     flush_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(DecodeQueue, receiveFlush_, core::FlushRequest));
 }
@@ -41,8 +43,8 @@ void DecodeQueue::receiveFlush_(const core::FlushRequest& req) {
     auto it = mQueue.begin();
     uint32_t squashed = 0;
     while (it != mQueue.end()) {
-        if (core::shouldSquash(it->pkt, req)) {
-            if (mVis) mVis->onSquash(it->pkt.fetch_seq, cycle);
+        if (core::shouldSquash(it->dp.pkt, req)) {
+            if (mVis) mVis->onSquash(it->dp.pkt.fetch_seq, cycle);
             it = mQueue.erase(it);
             ++squashed;
         } else {
@@ -62,7 +64,8 @@ void DecodeQueue::receiveDecodePackets_(const std::vector<core::DecodePacket>& p
     for (const auto& dp : pkts) {
         sparta_assert(mQueue.size() < mCapacity,
                       "[DecodeQueue] Queue overflow - backpressure should prevent this! queue_size=" << mQueue.size() << " capacity=" << mCapacity);
-        mQueue.push_back(dp);
+        // Decode sends with zero delay, after Rename has ticked this cycle.
+        mQueue.push_back({dp, current_cycle + 1 + mLatency});
         ++mNumEnqueued;
         if (mVis) mVis->onDecodeQueueEnter(dp.pkt.fetch_seq, current_cycle);
     }
@@ -70,13 +73,13 @@ void DecodeQueue::receiveDecodePackets_(const std::vector<core::DecodePacket>& p
 }
 
 void DecodeQueue::tick() {
-    // Nothing to do - Rename will pull packets when ready
+    if (!mQueue.empty() && !hasReady()) ++mNumLatencyWaitCycles;
 }
 
 core::DecodePacket DecodeQueue::pullOne() {
-    sparta_assert(!mQueue.empty(), "[DecodeQueue] pullOne called on empty queue");
+    sparta_assert(hasReady(), "[DecodeQueue] pullOne called with no uop past the decode-to-rename latency");
 
-    auto dp = std::move(mQueue.front());
+    auto dp = std::move(mQueue.front().dp);
     mQueue.pop_front();
 
     ++mNumDequeued;

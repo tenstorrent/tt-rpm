@@ -20,14 +20,13 @@ if ! command -v conda &>/dev/null; then
     exit 1
 fi
 
-echo "Adding ucb-bar and conda-forge channels (RISC-V toolchain; conda-forge for libzlib)..."
-conda config --add channels ucb-bar 2>/dev/null || true
-conda config --append channels conda-forge 2>/dev/null || true
-conda config --set channel_priority flexible 2>/dev/null || true
-
-echo "Creating conda env '$ENV_NAME' with riscv-tools..."
-conda create -n "$ENV_NAME" -c ucb-bar -c conda-forge -y riscv-tools || {
-    echo "If riscv-tools failed, try: conda create -n $ENV_NAME -c ucb-bar -c conda-forge -y riscv-tools"
+# --override-channels: riscv-tools (ucb-bar) and its deps (conda-forge) need nothing from the
+# Anaconda defaults channels, whose Terms of Service prompt aborts a non-interactive create.
+echo "Creating conda env '$ENV_NAME' with riscv-tools (channels: ucb-bar, conda-forge)..."
+conda create -n "$ENV_NAME" --override-channels -c ucb-bar -c conda-forge -y riscv-tools || {
+    echo "conda create failed. Check that https://conda.anaconda.org/ucb-bar and"
+    echo "https://conda.anaconda.org/conda-forge are reachable, or remove a partial env first:"
+    echo "  conda env remove -n $ENV_NAME"
     exit 1
 }
 

@@ -39,7 +39,8 @@ RUN_ICOUNT ?= 0
 
 # rv64gc/lp64d matches the toolchain multilib (libgcc/newlib); FP is never executed
 # in these int-only workloads. -nostartfiles uses our crt0; medany reaches 0x80000000.
-# The whisper.json ISA (tests/whisper.json) must cover what these binaries contain (imac).
+# tests/whisper.json must enable F/D even so: wrong-path fetch can decode FP instructions,
+# and Whisper cannot restore FP operands on a hart without them.
 COMMON_CFLAGS := -O2 -g -ffreestanding -nostartfiles -mcmodel=medany \
                  -march=rv64gc -mabi=lp64d -T $(RT)/link.ld
 

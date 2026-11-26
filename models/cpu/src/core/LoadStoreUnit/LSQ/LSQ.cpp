@@ -7,9 +7,12 @@
 
 #include "sparta/utils/MathUtils.hpp"
 
+#include "Common/ParamChoice.hpp"
 #include "Common/SpeculationUtils.hpp"
 #include "LoadStoreUnit/BackendMemoryStructures/BackendMemoryStructures.hpp"
 #include "Logging.hpp"
+#include "Midcore/Writeback/Writeback.hpp"
+#include "Mmu/Mmu.hpp"
 
 namespace midcore {
 
@@ -18,16 +21,39 @@ LSQ::LSQ(sparta::TreeNode* node, const LSQParams* params)
       mNumBanks(params->num_banks),
       mForwardingEnabled(params->store_forwarding),
       mForwardingLatency(params->forwarding_latency),
+      mLoadPorts(params->load_ports),
+      mStorePorts(params->store_ports),
+      mSsitClearInterval(params->ssit_clear_interval),
+      mStoreSets(params->ssit_entries, params->lfst_entries),
       mNumLoads(&unit_stat_set_, "num_loads", "Total load instructions", sparta::Counter::COUNT_NORMAL),
       mNumStores(&unit_stat_set_, "num_stores", "Total store instructions", sparta::Counter::COUNT_NORMAL),
       mNumForwards(&unit_stat_set_, "num_forwards", "Loads satisfied by store forwarding", sparta::Counter::COUNT_NORMAL),
       mNumSquashed(&unit_stat_set_, "num_squashed", "Instructions squashed due to flush", sparta::Counter::COUNT_NORMAL),
+      mNumAtomics(&unit_stat_set_, "num_atomics", "Atomics (AMO, LR, SC) performed in the D-cache", sparta::Counter::COUNT_NORMAL),
+      mNumFences(&unit_stat_set_, "num_fences", "Fences completed", sparta::Counter::COUNT_NORMAL),
+      mNumViolations(&unit_stat_set_, "num_ordering_violations", "Loads that read before an older overlapping store resolved its address",
+                     sparta::Counter::COUNT_NORMAL),
+      mNumStaleResponses(&unit_stat_set_, "num_stale_responses", "D-cache responses dropped: a squashed load's access whose tag a newer load reuses",
+                         sparta::Counter::COUNT_NORMAL),
+      mNumStoreSetWaits(&unit_stat_set_, "num_store_set_waits", "Loads held for a store the store-set predictor named", sparta::Counter::COUNT_NORMAL),
+      mNumOverlapWaits(&unit_stat_set_, "num_overlap_waits", "Loads held until an older overlapping store they cannot forward from writes the cache",
+                       sparta::Counter::COUNT_NORMAL),
+      mNumBarrierWaits(&unit_stat_set_, "num_barrier_waits", "Loads held behind an older fence or acquire atomic", sparta::Counter::COUNT_NORMAL),
+      mNumLoadPortStalls(&unit_stat_set_, "num_load_port_stalls", "Load-cycles a ready load found no free load port", sparta::Counter::COUNT_NORMAL),
+      mNumStorePortStalls(&unit_stat_set_, "num_store_port_stalls", "Cycles a retired store found no free store port", sparta::Counter::COUNT_NORMAL),
       mMaxLqOccupancy(&unit_stat_set_, "max_lq_occupancy", "Peak total load-queue occupancy", sparta::Counter::COUNT_LATEST),
       mMaxSqOccupancy(&unit_stat_set_, "max_sq_occupancy", "Peak total store-queue occupancy", sparta::Counter::COUNT_LATEST),
       mSumLqOccupancy(&unit_stat_set_, "sum_lq_occupancy", "Sum of load-queue occupancy per tick (mean = /cpu_cycles)", sparta::Counter::COUNT_NORMAL),
       mSumSqOccupancy(&unit_stat_set_, "sum_sq_occupancy", "Sum of store-queue occupancy per tick (mean = /cpu_cycles)", sparta::Counter::COUNT_NORMAL) {
     uint32_t lq_cap = params->load_queue_capacity;
     uint32_t sq_cap = params->store_queue_capacity;
+    const std::string dep = core::checkChoice(params->mem_dep_predictor, {"store_sets", "blind", "none"});
+    mMemDepMode = dep == "store_sets" ? MemDepMode::StoreSets : dep == "blind" ? MemDepMode::Blind : MemDepMode::None;
+    sparta_assert(mLoadPorts > 0 && mStorePorts > 0, "LSQ load_ports and store_ports must be at least 1");
+    sparta_assert(params->ssit_entries > 0 && params->lfst_entries > 0, "LSQ ssit_entries and lfst_entries must be at least 1");
+    sparta_assert(lq_cap > 0 && sq_cap > 0, "lsq.params.load_queue_capacity and store_queue_capacity must be at least 1");
+    // Rename's LQ/SQ credits are one pool, so a bank could fill while credits remain.
+    sparta_assert(mNumBanks == 1, params->num_banks.getLocation() << " = " << mNumBanks << "; only 1 is supported");
 
     // If num_banks > 1, each bank gets its own LQ and SQ
     // Divide capacity among banks
@@ -53,7 +79,6 @@ LSQ::LSQ(sparta::TreeNode* node, const LSQParams* params)
     // Bank index calculation: compute log2 of cache line size for address shift
     mLineShift = sparta::utils::floor_log2(static_cast<uint32_t>(params->cache_line_size));
     mBankMask = mNumBanks - 1;
-    sparta_assert(mNumBanks == 1 || (mNumBanks & mBankMask) == 0, "LSQ num_banks must be a power of 2, got " << mNumBanks);
 
     in_port.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(LSQ, receivePackets_, std::vector<core::IssuePacket>));
     response_in.registerConsumerHandler(CREATE_SPARTA_HANDLER_WITH_DATA(LSQ, receiveResponse_, core::MemResponse));
@@ -69,10 +94,6 @@ uint32_t LSQ::bankFor(cpu::address_t addr) const {
 
 void LSQ::receivePackets_(const std::vector<core::IssuePacket>& pkts) {
     for (const auto& ipkt : pkts) {
-        // If this tag was marked as flushed (had pending D-cache request), clear the mark
-        // since the tag is now being reused for a correct-path instruction
-        mFlushedPendingTags.erase(ipkt.pkt.tag);
-
         // Check if this packet should be squashed according to the most recent flush.
         // This handles race conditions where packets arrive in the same cycle as a flush.
         // Use fetch_seq for filtering: packets with fetch_seq <= flush's branch_fetch_seq and
@@ -89,19 +110,32 @@ void LSQ::receivePackets_(const std::vector<core::IssuePacket>& pkts) {
         // occupy an LQ/SQ slot with no backing credit and over-subscribe the queue (tripping
         // the "full despite rename credit" assert). Drop it. Otherwise its credit stays
         // consumed by the LQ/SQ entry it is about to occupy.
-        if (!claimArrived_(ipkt.pkt.fetch_seq)) {
+        const auto claim = claimArrived_(ipkt.pkt.fetch_seq);
+        if (!claim) {
             continue;
         }
 
-        // Extract address from trace record
+        const bool is_fence = ipkt.uop_type == core::UopType::Fence;
+        const bool is_atomic = ipkt.pkt.inst_class == cpu::InstClass::Atomic;
         cpu::address_t addr = 0;
         uint8_t size = 4;
-        if (ipkt.pkt.inst) {
-            const auto& vas = ipkt.pkt.inst->getTraceRecord().virtAddrs;
-            if (!vas.empty()) addr = vas[0];
+        std::vector<cpu::address_t> lines;
+        std::vector<MemRange> ranges;
+        bool is_lr = false;
+        if (ipkt.pkt.inst && !is_fence) {
+            const auto& rec = ipkt.pkt.inst->getTraceRecord();
+            if (!rec.physAddrs.empty()) addr = rec.physAddrs[0] ? rec.physAddrs[0] : rec.virtAddrs[0];
+            if (rec.dataSize) size = static_cast<uint8_t>(rec.dataSize);
+            lines = linesTouched_(rec);
+            ranges = rangesTouched_(rec);
+            is_lr = is_atomic && rec.assembly.starts_with("lr.");
         }
+        // A vector access with no active element (vl=0 or all masked off) touches no memory.
+        const auto* pac = ipkt.pkt.inst ? ipkt.pkt.inst->getPerfPtr().get() : nullptr;
+        const bool no_access = lines.empty() && pac && (pac->isVectorLoad() || pac->isVectorStore());
+        if (lines.empty() && !is_fence && !no_access) lines.push_back((addr >> mLineShift) << mLineShift);
 
-        bool is_store = (ipkt.uop_type == core::UopType::Store);
+        bool is_store = (ipkt.uop_type == core::UopType::Store || is_fence);
 
         // Check for and handle duplicate tags BEFORE dispatch.
         // Duplicate tags occur when a late wrong-path instruction with the same tag was
@@ -127,52 +161,87 @@ void LSQ::receivePackets_(const std::vector<core::IssuePacket>& pkts) {
         // Dispatch to load/store queues. A credit was claimed at rename, so the
         // target queue is guaranteed to have room.
         if (ipkt.uop_type == core::UopType::Load) {
-            dispatchLoad(ipkt, addr, size);
+            auto& lq = mLoadQueues[bankFor(addr)];
+            sparta_assert(!lq->isFull(), "LSQ load queue full despite rename credit");
+            auto& e = lq->enqueue(ipkt, addr, size, std::move(lines));
+            e.ranges = std::move(ranges);
+            e.dep_store_seq = claim->dep_seq;
+            if (no_access) e.forwarded = true;  // completes next tick with no cache request
             ++mNumLoads;
-        } else if (ipkt.uop_type == core::UopType::Store) {
-            dispatchStore(ipkt, addr, size);
-            ++mNumStores;
+        } else if (is_store) {
+            auto& sq = mStoreQueues[bankFor(addr)];
+            sparta_assert(!sq->isFull(), "LSQ store queue full despite rename credit");
+            auto& e = sq->enqueue(ipkt, addr, size, std::move(lines));
+            if (!is_lr) e.ranges = std::move(ranges);  // LR writes nothing
+            e.data_ready_cycle = getClock()->currentCycle();
+            e.pred_seq = claim->dep_seq;
+            e.is_fence = is_fence;
+            e.is_atomic = is_atomic;
+            e.acquire = claim->barrier && is_atomic;
+            if (!is_fence) ++mNumStores;
+            if (!e.ranges.empty()) {
+                if (mMemDepMode == MemDepMode::StoreSets) mStoreSets.issueStore(claim->pc, ipkt.pkt.fetch_seq);
+                checkOrderingViolation_(e);
+            }
         }
 
         // Add to completion order so the ROB learns about every memory op in program order.
         // OOO dispatch means packets may arrive out of order, so insert sorted by tag.
-        CompletionEntry new_entry{
-            .tag = ipkt.pkt.tag, .rob_token = ipkt.rob_token, .is_store = is_store, .completed = is_store};  // Stores complete immediately
+        // Plain stores complete once translated (this first query starts the walk on a TLB miss);
+        // fences and atomics when they are performed.
+        CompletionEntry new_entry{.tag = ipkt.pkt.tag,
+                                  .rob_token = ipkt.rob_token,
+                                  .is_store = is_store,
+                                  .completed = is_store && !is_fence && !is_atomic && (!mMmu || mMmu->dataReady(ipkt.pkt, true))};
         auto insert_pos = std::lower_bound(mCompletionOrder.begin(), mCompletionOrder.end(), new_entry,
                                            [](const CompletionEntry& a, const CompletionEntry& b) { return a.tag < b.tag; });
         mCompletionOrder.insert(insert_pos, new_entry);
 
         if (mVis) mVis->onLsqEnter(ipkt.pkt.fetch_seq, getClock()->currentCycle());
-        if (mVis && is_store) mVis->onLsqExit(ipkt.pkt.fetch_seq, getClock()->currentCycle());
+        if (mVis && is_store && !is_fence && !is_atomic) mVis->onLsqExit(ipkt.pkt.fetch_seq, getClock()->currentCycle());
     }
 }
 
-void LSQ::dispatchLoad(const core::IssuePacket& ipkt, cpu::address_t addr, uint8_t size) {
-    auto& lq = mLoadQueues[bankFor(addr)];
-    // A load credit was claimed at rename, so a slot is guaranteed. (Flat credits
-    // assume a single bank; multi-bank per-bank room is a Phase-2 concern.)
-    sparta_assert(!lq->isFull(), "LSQ load queue full despite rename credit (multi-bank without Phase 2?)");
-    lq->enqueue(ipkt, addr, size);
+// Physical addresses, so separate address spaces don't alias in shared caches; masked vector
+// elements touch nothing.
+std::vector<cpu::address_t> LSQ::linesTouched_(const WhisperUtil::TraceRecord& rec) const {
+    std::vector<cpu::address_t> lines;
+    const uint64_t size = rec.dataSize ? rec.dataSize : 1;
+    for (size_t i = 0; i < rec.virtAddrs.size(); ++i) {
+        if (i < rec.maskedAddrs.size() && rec.maskedAddrs[i]) continue;
+        const cpu::address_t a = (i < rec.physAddrs.size() && rec.physAddrs[i]) ? rec.physAddrs[i] : rec.virtAddrs[i];
+        for (cpu::address_t l = a >> mLineShift; l <= (a + size - 1) >> mLineShift; ++l) {
+            if (std::find(lines.begin(), lines.end(), l << mLineShift) == lines.end()) lines.push_back(l << mLineShift);
+        }
+    }
+    return lines;
 }
 
-void LSQ::dispatchStore(const core::IssuePacket& ipkt, cpu::address_t addr, uint8_t size) {
-    auto& sq = mStoreQueues[bankFor(addr)];
-    sparta_assert(!sq->isFull(), "LSQ store queue full despite rename credit (multi-bank without Phase 2?)");
-    sq->enqueue(ipkt, addr, size);
+std::vector<MemRange> LSQ::rangesTouched_(const WhisperUtil::TraceRecord& rec) const {
+    std::vector<MemRange> ranges;
+    const uint32_t size = rec.dataSize ? rec.dataSize : 1;
+    for (size_t i = 0; i < rec.virtAddrs.size(); ++i) {
+        if (i < rec.maskedAddrs.size() && rec.maskedAddrs[i]) continue;
+        ranges.push_back({(i < rec.physAddrs.size() && rec.physAddrs[i]) ? rec.physAddrs[i] : rec.virtAddrs[i], size});
+    }
+    return ranges;
 }
 
 void LSQ::receiveResponse_(const core::MemResponse& resp) {
-    // Check if this is a late response for a flushed request - ignore it
-    if (mFlushedPendingTags.count(resp.tag)) {
-        // Don't remove from mFlushedPendingTags yet - wait for tag reuse
-        return;
-    }
-
     // Find the load that this response is for
     for (uint32_t bank = 0; bank < mNumBanks; ++bank) {
         auto* entry = mLoadQueues[bank]->find(resp.tag);
         if (!entry) continue;
+        if (entry->req_id != resp.req_id) {
+            ++mNumStaleResponses;
+            return;
+        }
 
+        if (entry->responses_pending > 0) --entry->responses_pending;
+        if (entry->responses_pending > 0 || !entry->request_sent) {
+            if (mVis && resp.miss) mVis->onDcacheMiss(entry->ipkt.pkt.fetch_seq, getClock()->currentCycle());
+            return;
+        }
         entry->response_received = true;
         if (mVis) mVis->onLsqExit(entry->ipkt.pkt.fetch_seq, getClock()->currentCycle());
         if (mVis && resp.miss) {
@@ -195,7 +264,26 @@ void LSQ::receiveResponse_(const core::MemResponse& resp) {
         return;
     }
 
+    for (auto& sq : mStoreQueues) {
+        auto* e = sq->find(resp.tag);
+        if (!e || !e->is_atomic || e->responses_pending == 0 || e->req_id != resp.req_id) continue;
+        if (--e->responses_pending > 0) return;
+        // An atomic bypasses the write-port arbiter, like Execute's store destinations.
+        if (!e->ipkt.phys_dsts.empty()) completion_out.send(e->ipkt.phys_dsts, 1);
+        finishSqEntry_(*e);
+        ++mNumAtomics;
+        if (mVis) mVis->onLsqExit(e->ipkt.pkt.fetch_seq, getClock()->currentCycle());
+        return;
+    }
+
     ILOG("[lsq] Response for unknown tag=" << resp.tag);
+}
+
+const std::vector<core::PhysRegRef>* LSQ::singleAccessLoadDsts(uint64_t tag, uint64_t req_id) const {
+    for (const auto& lq : mLoadQueues) {
+        if (const auto* entry = lq->find(tag)) return entry->lines.size() == 1 && entry->req_id == req_id ? &entry->ipkt.phys_dsts : nullptr;
+    }
+    return nullptr;
 }
 
 void LSQ::receiveFlush_(const core::FlushRequest& req) {
@@ -225,13 +313,7 @@ void LSQ::receiveFlush_(const core::FlushRequest& req) {
         auto& lq = mLoadQueues[bank];
         std::vector<uint64_t> to_remove;
         for (auto& entry : *lq) {
-            if (should_squash(entry.ipkt.pkt)) {
-                to_remove.push_back(entry.ipkt.pkt.tag);
-                // If D-cache request is in flight, track the tag so we can ignore late responses
-                if (entry.request_sent && !entry.response_received) {
-                    mFlushedPendingTags.insert(entry.ipkt.pkt.tag);
-                }
-            }
+            if (should_squash(entry.ipkt.pkt)) to_remove.push_back(entry.ipkt.pkt.tag);
         }
         for (uint64_t tag : to_remove) {
             lq->removeByTag(tag);
@@ -252,9 +334,7 @@ void LSQ::receiveFlush_(const core::FlushRequest& req) {
         auto& sq = mStoreQueues[bank];
         std::vector<uint64_t> to_remove;
         for (auto& entry : *sq) {
-            if (!entry.committed && should_squash(entry.ipkt.pkt)) {
-                to_remove.push_back(entry.ipkt.pkt.tag);
-            }
+            if (!entry.committed && should_squash(entry.ipkt.pkt)) to_remove.push_back(entry.ipkt.pkt.tag);
         }
         for (uint64_t tag : to_remove) {
             sq->removeByTag(tag);
@@ -288,65 +368,216 @@ void LSQ::receiveFlush_(const core::FlushRequest& req) {
         }
     }
 
-    // Squash from completion order tracking (fallback for tag > branch_tag).
-    // Mostly redundant since entries are removed from mCompletionOrder together with
-    // their load/store queue entries above; kept for safety.
-    auto co_it = mCompletionOrder.begin();
-    while (co_it != mCompletionOrder.end()) {
-        if (co_it->tag > req.branch_tag) {
-            co_it = mCompletionOrder.erase(co_it);
-        } else {
-            ++co_it;
-        }
-    }
-
     mNumSquashed += total_squashed;
     ILOG("[lsq] Squashed " << total_squashed << " entries from LSQ");
 }
 
-bool LSQ::checkStoreForwarding(LoadQueue::Entry& load) {
-    if (!mForwardingEnabled) return false;
+// A fence or acquire atomic is a barrier: younger loads wait until it is performed.
+uint64_t LSQ::oldestBarrierTag_() const {
+    uint64_t oldest = UINT64_MAX;
+    for (const auto& [seq, c] : mClaimedNotArrived)
+        if (c.barrier) oldest = std::min(oldest, c.tag);
+    for (const auto& sq : mStoreQueues)
+        for (const auto& e : *sq)
+            if ((e.is_fence || e.acquire) && !e.sent_to_cache) oldest = std::min(oldest, e.ipkt.pkt.tag);
+    return oldest;
+}
 
-    uint32_t bank = bankFor(load.address);
-    auto& sq = mStoreQueues[bank];
-
-    // Check store queue for forwarding (only stores older than this load)
-    const auto* st = sq->findForwardingOlderThan(load.address, load.access_size, load.ipkt.pkt.tag);
-    if (st) {
-        load.forwarded = true;
-        load.forward_cycles = mForwardingLatency;
-        ++mNumForwards;
-        ILOG("[lsq] Store forwarding: load tag=" << load.ipkt.pkt.tag << " from store tag=" << st->ipkt.pkt.tag);
-        return true;
+// A store has resolved once its address is known and so has every older store of its set.
+bool LSQ::storeResolved_(uint64_t seq) const {
+    while (seq != StoreSetPredictor::kNone) {
+        if (mClaimedNotArrived.count(seq)) return false;
+        const StoreQueue::Entry* found = nullptr;
+        for (const auto& sq : mStoreQueues) {
+            for (const auto& e : *sq) {
+                if (e.ipkt.pkt.fetch_seq == seq) {
+                    found = &e;
+                    break;
+                }
+            }
+            if (found) break;
+        }
+        if (!found) return true;  // retired or squashed
+        seq = found->pred_seq;
     }
+    return true;
+}
 
-    return false;
+const StoreQueue::Entry* LSQ::youngestOlderStore_(const LoadQueue::Entry& load) const {
+    const StoreQueue::Entry* best = nullptr;
+    for (const auto& sq : mStoreQueues) {
+        const auto* st = sq->youngestOverlappingOlderThan(load.ranges, load.ipkt.pkt.tag);
+        if (st && (!best || st->ipkt.pkt.tag > best->ipkt.pkt.tag)) best = st;
+    }
+    return best;
+}
+
+// Ordering checks before a load reads the cache. On Forward, src is the store-queue entry
+// that supplies the data, or nullptr for the store buffer.
+LSQ::LoadStep LSQ::orderLoad_(LoadQueue::Entry& load, uint64_t barrier_tag, const StoreQueue::Entry*& src) {
+    auto wait = [&load](WaitReason r, sparta::Counter& c) {
+        if (!(load.waits_counted & r)) ++c;
+        load.waits_counted |= r;
+        return LoadStep::Wait;
+    };
+    if (load.ipkt.pkt.tag > barrier_tag) return wait(kWaitBarrier, mNumBarrierWaits);
+    if (mMemDepMode == MemDepMode::StoreSets && !storeResolved_(load.dep_store_seq)) return wait(kWaitStoreSet, mNumStoreSetWaits);
+
+    src = youngestOlderStore_(load);
+    // A performed atomic has written the cache, after every older store drained.
+    if (src && src->is_atomic && src->sent_to_cache) src = nullptr;
+    if (src) {
+        const auto& st = src->ranges;
+        const auto& ld = load.ranges;
+        const bool covers =
+            !src->is_atomic && st.size() == 1 && ld.size() == 1 && st[0].addr <= ld[0].addr && st[0].addr + st[0].size >= ld[0].addr + ld[0].size;
+        // A partial overlap cannot forward: the load reads the cache after the store writes it.
+        if (!covers || !mForwardingEnabled) return wait(kWaitOverlap, mNumOverlapWaits);
+        return LoadStep::Forward;
+    }
+    int sb = 0;
+    for (const auto& r : load.ranges) sb = std::max(sb, mDcache->storeBufferOverlap(r.addr, r.size));
+    if (sb == 0) return LoadStep::ReadCache;
+    // A retired store not yet in the cache: forward a full cover, else wait for the write.
+    if (sb == 2 || !mForwardingEnabled || load.ranges.size() != 1) return wait(kWaitOverlap, mNumOverlapWaits);
+    return LoadStep::Forward;
 }
 
 void LSQ::tryIssueLoads() {
     if (!mDcache) return;
 
+    const uint64_t barrier = oldestBarrierTag_();
+    const uint64_t now = getClock()->currentCycle();
     for (uint32_t bank = 0; bank < mNumBanks; ++bank) {
         for (auto& entry : *mLoadQueues[bank]) {
             if (entry.request_sent || entry.forwarded || entry.response_received) continue;
-
-            // Try store forwarding first
-            if (checkStoreForwarding(entry)) {
-                continue;  // Forwarded, no cache access needed
+            if (mMmu && !mMmu->dataReady(entry.ipkt.pkt, false)) continue;
+            const StoreQueue::Entry* src = nullptr;
+            const LoadStep step = entry.next_line == 0 ? orderLoad_(entry, barrier, src) : LoadStep::ReadCache;
+            if (step == LoadStep::Wait) continue;
+            if (mLoadPortsLeft == 0) {
+                ++mNumLoadPortStalls;
+                continue;
             }
 
-            // Try to send to D-cache
-            core::MemRequest req;
-            req.tag = entry.ipkt.pkt.tag;
-            req.pc = entry.ipkt.pkt.pc;
-            req.address = entry.address;
-            req.access_size = entry.access_size;
-            req.is_store = false;
+            if (step == LoadStep::Forward) {
+                --mLoadPortsLeft;
+                entry.forwarded = true;
+                entry.forward_cycles = mForwardingLatency + (src && src->data_ready_cycle > now ? src->data_ready_cycle - now : 0);
+                entry.fwd_from_sq = src != nullptr;
+                entry.fwd_store_tag = src ? src->ipkt.pkt.tag : 0;
+                ++mNumForwards;
+                ILOG("[lsq] Store forwarding: load tag=" << entry.ipkt.pkt.tag << " from_sq=" << entry.fwd_from_sq << " store tag=" << entry.fwd_store_tag);
+                continue;
+            }
 
-            if (mDcache->canAcceptRequest(req.address)) {
+            // One D-cache request per line touched; the load completes on the last response.
+            if (entry.next_line == 0) entry.req_id = ++mNextReqId;
+            while (entry.next_line < entry.lines.size() && mLoadPortsLeft > 0 && mDcache->canAcceptRequest(entry.lines[entry.next_line])) {
+                core::MemRequest req;
+                req.tag = entry.ipkt.pkt.tag;
+                req.req_id = entry.req_id;
+                req.pc = entry.ipkt.pkt.pc;
+                req.address = entry.next_line == 0 ? entry.address : entry.lines[entry.next_line];
+                req.access_size = entry.access_size;
+                req.is_store = false;
                 request_out.send(req, 0);
-                entry.request_sent = true;
+                ++entry.next_line;
+                ++entry.responses_pending;
+                --mLoadPortsLeft;
             }
+            entry.request_sent = entry.next_line == entry.lines.size();
+        }
+    }
+}
+
+// The oldest load that read st's bytes before st's address was known is replayed from
+// the ROB head; loads that forwarded from a younger covering store read the right data.
+void LSQ::checkOrderingViolation_(const StoreQueue::Entry& st) {
+    if (mMemDepMode == MemDepMode::None) return;
+    LoadQueue::Entry* oldest = nullptr;
+    for (auto& lq : mLoadQueues) {
+        for (auto& ld : *lq) {
+            if (ld.ipkt.pkt.tag <= st.ipkt.pkt.tag) continue;
+            if (ld.next_line == 0 && !ld.forwarded && !ld.response_received) continue;
+            if (ld.fwd_from_sq && ld.fwd_store_tag > st.ipkt.pkt.tag) continue;
+            if (!overlaps(ld.ranges, st.ranges)) continue;
+            if (!oldest || ld.ipkt.pkt.tag < oldest->ipkt.pkt.tag) oldest = &ld;
+        }
+    }
+    if (!oldest) return;
+    if (!oldest->violation) ++mNumViolations;
+    oldest->violation = true;
+    if (mMemDepMode == MemDepMode::StoreSets) mStoreSets.train(oldest->ipkt.pkt.pc, st.ipkt.pkt.pc);
+    ILOG("[lsq] Ordering violation: load tag=" << oldest->ipkt.pkt.tag << " read before store tag=" << st.ipkt.pkt.tag);
+}
+
+bool LSQ::hasOrderingViolation(uint64_t tag) const {
+    for (const auto& lq : mLoadQueues)
+        if (const auto* e = lq->find(tag)) return e->violation;
+    return false;
+}
+
+// Every older store, fence and atomic has left the SQ and the store buffer has drained.
+bool LSQ::olderStoresDrained_(uint64_t tag) const {
+    for (const auto& sq : mStoreQueues)
+        for (const auto& e : *sq)
+            if (e.ipkt.pkt.tag < tag) return false;
+    return mDcache->storeBufferEmpty();
+}
+
+void LSQ::finishSqEntry_(StoreQueue::Entry& e) {
+    e.sent_to_cache = true;
+    auto it =
+        std::lower_bound(mCompletionOrder.begin(), mCompletionOrder.end(), e.ipkt.pkt.tag, [](const CompletionEntry& ce, uint64_t t) { return ce.tag < t; });
+    if (it != mCompletionOrder.end() && it->tag == e.ipkt.pkt.tag) it->completed = true;
+}
+
+// A fence completes once every older memory op has been performed: older loads have their
+// data, and older stores have left the SQ and the store buffer.
+void LSQ::completeFences_() {
+    for (auto& sq : mStoreQueues) {
+        for (auto& e : *sq) {
+            if (!e.is_fence || e.sent_to_cache) continue;
+            const uint64_t tag = e.ipkt.pkt.tag;
+            bool older_pending = false;
+            for (const auto& [seq, c] : mClaimedNotArrived) older_pending |= c.tag < tag;
+            for (const auto& lq : mLoadQueues)
+                for (const auto& ld : *lq) older_pending |= ld.ipkt.pkt.tag < tag && !mLoadCompletedTags.count(ld.ipkt.pkt.tag);
+            if (older_pending || !olderStoresDrained_(tag)) continue;
+            finishSqEntry_(e);
+            ++mNumFences;
+            if (mVis) mVis->onLsqExit(e.ipkt.pkt.fetch_seq, getClock()->currentCycle());
+        }
+    }
+}
+
+// Atomics are performed non-speculatively at the ROB head, after older stores drain, as a
+// load that takes the line exclusive and writes it.
+void LSQ::issueAtomics_() {
+    for (auto& sq : mStoreQueues) {
+        for (auto& e : *sq) {
+            if (!e.is_atomic || e.request_sent) continue;
+            const bool at_head = mRob ? (!mRob->empty() && mRob->head().fetch_seq == e.ipkt.pkt.fetch_seq)
+                                      : (!mCompletionOrder.empty() && mCompletionOrder.front().tag == e.ipkt.pkt.tag);
+            if (!at_head || !olderStoresDrained_(e.ipkt.pkt.tag)) continue;
+            if (mMmu && !mMmu->dataReady(e.ipkt.pkt, true)) continue;
+            if (mLoadPortsLeft == 0) {
+                ++mNumLoadPortStalls;
+                continue;
+            }
+            if (!mDcache->canAcceptRequest(e.lines.front())) continue;
+            core::MemRequest req;
+            req.tag = e.ipkt.pkt.tag;
+            req.pc = e.ipkt.pkt.pc;
+            req.address = e.address;
+            req.access_size = e.access_size;
+            req.exclusive = true;
+            req.req_id = e.req_id = ++mNextReqId;
+            request_out.send(req, 0);
+            --mLoadPortsLeft;
+            e.request_sent = true;
+            e.responses_pending = 1;
         }
     }
 }
@@ -354,19 +585,30 @@ void LSQ::tryIssueLoads() {
 void LSQ::tryDrainStores() {
     if (!mDcache) return;
 
+    uint32_t ports = mStorePorts;
+    // Stores sent this cycle reach the store buffer after this returns, so count its room here.
+    uint32_t room = mDcache->storeBufferRoom();
     for (uint32_t bank = 0; bank < mNumBanks; ++bank) {
-        auto* entry = mStoreQueues[bank]->nextDrainable();
-        if (!entry) continue;
+        while (auto* entry = mStoreQueues[bank]->nextDrainable()) {
+            if (room == 0) return;
+            if (ports == 0) {
+                ++mNumStorePortStalls;
+                return;
+            }
+            --ports;
 
-        core::MemRequest req;
-        req.tag = entry->ipkt.pkt.tag;
-        req.pc = entry->ipkt.pkt.pc;
-        req.address = entry->address;
-        req.access_size = entry->access_size;
-        req.is_store = true;
-
-        if (mDcache->canAcceptStore()) {
-            request_out.send(req, 0);
+            while (entry->next_line < entry->lines.size() && room > 0) {
+                core::MemRequest req;
+                req.tag = entry->ipkt.pkt.tag;
+                req.pc = entry->ipkt.pkt.pc;
+                req.address = entry->next_line == 0 ? entry->address : entry->lines[entry->next_line];
+                req.access_size = entry->access_size;
+                req.is_store = true;
+                request_out.send(req, 0);
+                ++entry->next_line;
+                --room;
+            }
+            if (entry->next_line < entry->lines.size()) return;
             entry->sent_to_cache = true;
             ILOG("[lsq] Store tag=" << entry->ipkt.pkt.tag << " drained to cache");
         }
@@ -389,6 +631,7 @@ void LSQ::drainCompletedEntries() {
     while (skip_count < mCompletionOrder.size()) {
         auto it = mCompletionOrder.begin() + skip_count;
         auto& ce = *it;
+        if (ce.is_store && !ce.completed) ce.completed = storeTranslated_(ce.tag);
 
         // Check completion: stores are completed immediately (ce.completed),
         // loads use mLoadCompletedTags set (O(1) lookup instead of O(n) scan)
@@ -426,7 +669,7 @@ void LSQ::drainCompletedEntries() {
         } else {
             // Loads: Send ROB completion when data is received.
             // This allows Writeback to retire the instruction.
-            // The LQ entry is only REMOVED when written_back=true (after arbiter grants).
+            // The LQ entry is only REMOVED once written back and retired.
 
             // Send ROB completion if not already sent
             if (!ce.rob_sent) {
@@ -445,7 +688,7 @@ void LSQ::drainCompletedEntries() {
             }
 
             if (!can_remove) {
-                // Load is in LQ, ROB completion sent, but not yet written back.
+                // Load is in LQ, ROB completion sent, but not yet written back or retired.
                 // Skip this entry to allow younger instructions to drain.
                 ++skip_count;
                 continue;
@@ -466,7 +709,17 @@ void LSQ::drainCompletedEntries() {
     }
 }
 
+bool LSQ::storeTranslated_(uint64_t tag) {
+    for (auto& sq : mStoreQueues) {
+        // Fences and atomics complete when performed, not on translation.
+        if (auto* e = sq->find(tag)) return !e->is_fence && !e->is_atomic && (!mMmu || mMmu->dataReady(e->ipkt.pkt, true));
+    }
+    return true;
+}
+
 void LSQ::tick() {
+    if (mSsitClearInterval && getClock()->currentCycle() % mSsitClearInterval == 0) mStoreSets.clear();
+
     // Advance forwarding countdowns
     for (auto& lq : mLoadQueues) {
         lq->tickForwardCountdowns();
@@ -489,6 +742,13 @@ void LSQ::tick() {
                 mLoadCompletedTags.insert(entry.ipkt.pkt.tag);
             }
         }
+    }
+
+    // Atomics first: one at the ROB head is the oldest memory op.
+    mLoadPortsLeft = mLoadPorts;
+    if (mDcache) {
+        completeFences_();
+        issueAtomics_();
     }
 
     // Try to issue pending loads
@@ -517,7 +777,7 @@ void LSQ::tick() {
     // Drain completed entries
     drainCompletedEntries();
 
-    // Phase 0 observability: record occupancy after this cycle's work.
+    // Record occupancy after this cycle's work.
     sampleOccupancyStats();
 }
 
@@ -535,15 +795,22 @@ void LSQ::sampleOccupancyStats() {
     mSumSqOccupancy += sq;
 }
 
-void LSQ::claimLoad(uint64_t fetch_seq, uint64_t tag, uint8_t depth) {
-    // Rename only calls this after canClaimLoad(), so a credit is available.
-    --mLoadCredits;
-    mClaimedNotArrived[fetch_seq] = ClaimInfo{tag, depth, /*is_store=*/false};
-}
-
-void LSQ::claimStore(uint64_t fetch_seq, uint64_t tag, uint8_t depth) {
-    --mStoreCredits;
-    mClaimedNotArrived[fetch_seq] = ClaimInfo{tag, depth, /*is_store=*/true};
+void LSQ::claim(const core::DecodePacket& dp) {
+    // Rename only calls this after canClaimLoad()/canClaimStore(), so a credit is available.
+    const auto& pkt = dp.pkt;
+    ClaimInfo c{.tag = pkt.tag, .depth = pkt.wrong_path_depth, .is_store = dp.uop_type != core::UopType::Load, .pc = pkt.pc};
+    const bool is_atomic = pkt.inst_class == cpu::InstClass::Atomic;
+    const bool is_lr = is_atomic && pkt.inst && pkt.inst->getTraceRecord().assembly.starts_with("lr.");
+    // A fence is treated as rw,rw; an atomic with aq set orders every younger load.
+    c.barrier = dp.uop_type == core::UopType::Fence || (is_atomic && pkt.inst && ((pkt.inst->getTraceRecord().inst >> 26) & 1));
+    if (mMemDepMode == MemDepMode::StoreSets) {
+        if (!c.is_store)
+            c.dep_seq = mStoreSets.dispatchLoad(pkt.pc);
+        else if (dp.uop_type == core::UopType::Store && !is_lr)
+            c.dep_seq = mStoreSets.dispatchStore(pkt.pc, pkt.fetch_seq);
+    }
+    --(c.is_store ? mStoreCredits : mLoadCredits);
+    mClaimedNotArrived[pkt.fetch_seq] = c;
 }
 
 void LSQ::processWritePortGrants() {
@@ -570,6 +837,15 @@ void LSQ::processWritePortGrants() {
 void LSQ::commitStore(uint64_t tag) {
     for (auto& sq : mStoreQueues) {
         if (auto* entry = sq->find(tag)) {
+            entry->committed = true;
+            return;
+        }
+    }
+}
+
+void LSQ::commitLoad(uint64_t tag) {
+    for (auto& lq : mLoadQueues) {
+        if (auto* entry = lq->find(tag)) {
             entry->committed = true;
             return;
         }

@@ -56,6 +56,9 @@ void WritePortArbiter::arbitrate() {
         }
     }
 
+    mNumDenied = 0;
+    for (const auto& [src, vec] : mPending) mNumDenied += static_cast<uint32_t>(vec.size());
+
     // Mark denied candidates for write-port stall visualization
     if (mVis) {
         for (auto& [src, vec] : mPending) {
